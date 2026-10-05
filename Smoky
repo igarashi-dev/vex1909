@@ -1,0 +1,2869 @@
+#include "main.h"
+#include "lemlib/chassis/chassis.hpp"
+#include "lemlib/chassis/trackingWheel.hpp"
+#include "liblvgl/llemu.hpp"
+#include "pros/abstract_motor.hpp"
+#include "pros/adi.hpp"
+#include "lemlib/api.hpp" // IWYU pragma: keep
+#include "pros/ai_vision.hpp"
+#include "pros/device.hpp"
+#include "pros/distance.hpp"
+#include "pros/llemu.hpp"
+#include "pros/misc.h"
+#include "pros/misc.hpp"
+#include "pros/motor_group.hpp"
+#include "pros/motors.h"
+#include "pros/motors.hpp"
+#include "pros/optical.hpp"
+#include "pros/rotation.hpp"
+#include "pros/rtos.h"
+#include "pros/rtos.hpp"
+#include "pros/vision.hpp"
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <ctime>
+#include <math.h>
+#include <optional>
+#include <sys/_intsup.h>
+#include "pros/colors.hpp"
+
+
+
+
+
+//Initialize controller
+pros::Controller controller(pros::E_CONTROLLER_MASTER);
+
+//Initialize the left side of the drivetrain motors and their ports
+pros::MotorGroup leftMotors({-1, -13, -11}); 
+
+// -14, -11, -4
+//pros::MotorGroup leftMotors({-14, -4, -11}); 
+
+
+//Initialize the right side of the drivetrain motors and their ports
+pros::MotorGroup rightMotors({20,17,10});
+
+//19, 17, 7
+//pros::MotorGroup rightMotors({19,17,7});
+
+
+//pros::MotorGroup fullDrive({-13, -11, -1, 20, 17, 10}, pros::MotorGearset::blue);
+
+//Initialize intake motors into a motor group
+pros::MotorGroup liftMotors({7,-4}, pros::MotorGearset::blue);
+
+//-15, 18
+//pros::MotorGroup liftMotors({18,-15}, pros::MotorGearset::blue);
+
+
+pros::Motor leftLift(7);
+
+//18
+//pros::Motor leftLift(18);
+
+
+pros::Motor rightLift(-4);
+
+//-15
+//pros::Motor rightLift(-15);
+
+
+pros::MotorGroup chainBarMotor({-14,15}, pros::MotorGearset::green); 
+
+//-3, 2
+//pros::MotorGroup chainBarMotor({-3,2}, pros::MotorGearset::green); 
+
+
+pros::Motor leftChain(15);
+
+//2
+//pros::Motor leftChain(2);
+
+
+pros::Motor rightChain(-14);
+
+//-3
+//pros::Motor rightChain(-3);
+
+
+
+
+//Initialize clamp piston
+pros::adi::DigitalOut clamp('G');
+
+//G
+
+//Initialize Rake piston
+pros::adi::DigitalOut Rake('H');
+
+
+
+pros::adi::DigitalOut wedge('E');
+
+//H
+
+//Initialize inertial sensor 
+pros::Imu imu(18);
+
+//16
+
+
+//Initialize distance sensor for front goal detection
+
+
+pros::Distance distance_Left(3);
+
+//8
+
+pros::Distance distance_Right(8);
+
+pros::Distance leftAutoClampDistance(5);
+pros::Distance RightAutoClampDistance(6);
+
+
+//5
+
+//Initialize roller arm piston
+
+
+// tracking wheels
+// horizontal tracking wheel encoder. Rotation sensor, port 5,  reversed
+////pros::Rotation horizontalEnc(-100);
+
+// vertical tracking wheel encoder. Rotation sensor, port 6, not reversed
+pros::Rotation verticalEnc(2);
+
+// horizontal tracking wheel. 2" diameter, 2" offset, back of the robot (negative)
+//lemlib::TrackingWheel horizontal(&horizontalEnc, lemlib::Omniwheel::NEW_2, -2);
+
+// vertical tracking wheel. 2" diameter, 2" offset, right of the robot (positive)
+lemlib::TrackingWheel vertical(&verticalEnc, lemlib::Omniwheel::NEW_2, 0.6);
+
+// drivetrain settings
+lemlib::Drivetrain drivetrain(&leftMotors, // left motor group
+                              &rightMotors, // right motor group
+                              10.5, // 10.5 inch track width
+                              lemlib::Omniwheel::NEW_275, // using new 2.75" omnis
+                              450, // drivetrain rpm is 450
+                              2 // horizontal drift is 2. If we had traction wheels, it would have been 8
+);
+
+// lateral motion controller
+lemlib::ControllerSettings linearController(3.15, // proportional gain (kP)
+                                            0.004, // integral gain (kI)
+                                            34, // derivative gain (kD)
+                                            0, // anti windup
+                                            0, // small error range, in inches
+                                            0, // small error range timeout, in milliseconds
+                                            0, // large error range, in inches
+                                            0, // large error range timeout, in milliseconds
+                                            0 // maximum acceleration (slew)
+);
+
+// angular motion controller
+
+lemlib::ControllerSettings angularController(3.05, // proportional gain (kP)
+                                             0., // integral gain (kI)
+                                             22.7, // derivative gain (kD)
+                                             0, // anti windup
+                                             0, // small error range, in degrees
+                                             0, // small error range timeout, in milliseconds
+                                             0, // large error range, in degrees
+                                             0, // large error range timeout, in milliseconds
+                                             0 // maximum acceleration (slew)
+);
+
+/*lemlib::ControllerSettings angularController(2.95, // proportional gain (kP)
+                                             0.0005, // integral gain (kI)
+                                             24, // derivative gain (kD)
+                                             0, // anti windup
+                                             0, // small error range, in degrees
+                                             0, // small error range timeout, in milliseconds
+                                             0, // large error range, in degrees
+                                             0, // large error range timeout, in milliseconds
+                                             0 // maximum acceleration (slew)
+);
+
+*/
+
+
+
+
+
+
+// sensors for odometry
+lemlib::OdomSensors sensors(&vertical, // vertical tracking wheel
+                            nullptr, // vertical tracking wheel 2, set to nullptr as we don't have a second one
+                            nullptr, // horizontal tracking wheel
+                            nullptr, // horizontal tracking wheel 2, set to nullptr as we don't have a second one
+                            &imu // inertial sensor
+);
+
+// input curve for throttle input during driver control
+lemlib::ExpoDriveCurve throttleCurve(3, // joystick deadband out of 127
+                                     10, // minimum output where drivetrain will move out of 127
+                                     1.01 // expo curve gain
+);
+
+// input curve for steer input during driver control
+lemlib::ExpoDriveCurve steerCurve(3, // joystick deadband out of 127
+                                  10, // minimum output where drivetrain will move out of 127
+                                  1.018 // expo curve gain
+);
+
+// create the chassis
+lemlib::Chassis chassis(drivetrain, linearController, angularController, sensors, &throttleCurve, &steerCurve);
+
+bool clampValue=false;
+bool liftAfterChain = false;
+bool liftlowering=false;
+bool driverOverride =false;
+bool cascadeOverride =false;
+bool liftRunning = false;
+bool pinPrime=false;
+bool downToggle=false;
+
+
+lemlib::PID liftPID(
+    1.0,   // kP
+    0.0,    // kI
+    0.3,   // kD
+    5,      
+    127     
+);
+
+
+lemlib::PID chainPID(
+    0.35,   // kP
+    0.0,    // kI
+    0.9,   // kD
+    2,
+    127
+);
+lemlib::PID driverChainPID(
+    0.95,   // kP
+    0.05,    // kI
+    0.3,   // kD
+    2,
+    167
+);
+
+pros::Task* liftTask = nullptr;
+pros::Task* chainTask = nullptr;
+pros::Task* lowerEveryTask = nullptr;
+pros::Task* clampTask = nullptr;
+
+
+int liftTarget = 0;
+int chainTarget = 0;
+
+int liftMaxSpeed = 127;
+int chainMaxSpeed = 127;
+
+//bool liftRunning = false;
+bool chainRunning = false;
+
+
+void liftTaskFn() {
+    liftRunning = true;
+    int stable = 0;
+
+    while (true) {
+        double pos = leftLift.get_position();
+        double err = liftTarget - pos;
+        double out = liftPID.update(err);
+        if (out > liftMaxSpeed) out = liftMaxSpeed;
+        if (out < -liftMaxSpeed) out = -liftMaxSpeed;
+        //liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_COAST);
+        liftMotors.move(out);
+
+
+        if(fabs(err)<30||cascadeOverride==true){
+    stable += 10;
+
+    if(stable >= 150||cascadeOverride==true){
+
+        liftMotors.brake();
+        liftRunning=false;
+        pinPrime=false;
+
+        return;
+    }
+
+}else{
+    stable=0;
+}
+
+        pros::delay(10);
+    }
+
+    liftMotors.set_brake_mode(pros::MotorBrake::hold);
+    liftMotors.brake();
+    liftRunning = false;
+}
+
+
+void moveLiftTo(int pos, int maxSpeed) {
+    liftTarget = pos;
+    liftMaxSpeed = maxSpeed;
+
+    if (liftRunning && liftTask != nullptr) {
+        liftTask->remove();      // stop the task
+        delete liftTask;         // free memory
+        liftTask = nullptr;
+        liftRunning = false;
+    }
+
+    liftTask = new pros::Task(liftTaskFn);
+}
+
+void chainTaskFn() {
+    chainRunning = true;
+    int stable = 0;
+    while (true) {
+       
+        double pos = chainBarMotor.get_position();
+        double err = chainTarget - pos;
+        double out = chainPID.update(err);
+        if (out > chainMaxSpeed) out= chainMaxSpeed;
+        if (out < -chainMaxSpeed) out = -chainMaxSpeed;
+        chainBarMotor.move(out);
+       if (fabs(err) < 30||driverOverride==true) {
+            stable += 10;
+            if (stable >= 150||driverOverride==true){
+                chainBarMotor.brake();
+                chainRunning=false;
+                if (liftAfterChain&&downToggle==false) {
+        liftAfterChain = false;
+            moveLiftTo(278, 127);
+            downToggle=true;
+            liftlowering = false;
+                }else if(liftAfterChain&&downToggle==true){
+                    moveLiftTo(0, 127);
+                    downToggle=false;
+                }
+                return;
+            }
+        } else {
+            stable = 0;
+        }
+    
+        pros::delay(10);
+    
+    
+    }
+    chainBarMotor.set_brake_mode(pros::MotorBrake::hold);
+    chainBarMotor.brake();
+    chainRunning = false;
+}
+
+void moveChainTo(int pos, int maxSpeed) {
+    chainTarget = pos;
+    chainMaxSpeed = maxSpeed;
+    if (chainRunning && chainTask != nullptr) {
+        chainTask->remove();      // stop the task
+        delete chainTask;         // free memory
+        chainTask = nullptr;
+        chainRunning = false;
+    }
+    chainTask = new pros::Task(chainTaskFn);
+}
+void driverChainTaskFn() {
+    chainRunning = true;
+    int stable = 0;
+    while (true) {
+       
+        double pos = chainBarMotor.get_position();
+        double err = chainTarget - pos;
+        double out = chainPID.update(err);
+        if (out > chainMaxSpeed) out= chainMaxSpeed;
+        if (out < -chainMaxSpeed) out = -chainMaxSpeed;
+        chainBarMotor.move(out);
+       if (fabs(err) < 30||driverOverride==true) {
+            stable += 10;
+            if (stable >= 150||driverOverride==true){
+                chainBarMotor.brake();
+                chainRunning=false;
+                if (liftAfterChain) {
+        liftAfterChain = false;
+            moveLiftTo(0, 127);
+
+            liftlowering = false;
+    }
+                return;
+            }
+        } else {
+            stable = 0;
+        }
+    
+        pros::delay(10);
+    
+    
+    }
+    chainBarMotor.set_brake_mode(pros::MotorBrake::hold);
+    chainBarMotor.brake();
+    chainRunning = false;
+}
+
+void driverMoveChainTo(int pos, int maxSpeed) {
+    chainTarget = pos;
+    chainMaxSpeed = maxSpeed;
+    if (chainRunning && chainTask != nullptr) {
+        chainTask->remove();      // stop the task
+        delete chainTask;         // free memory
+        chainTask = nullptr;
+        chainRunning = false;
+    }
+    chainTask = new pros::Task(driverChainTaskFn);
+}
+void driverLiftTaskFn() {
+    liftRunning = true;
+    int stable = 0;
+
+    while (true) {
+        double pos = leftLift.get_position();
+        double err = liftTarget - pos;
+        double out = liftPID.update(err);
+        if (out > liftMaxSpeed) out = liftMaxSpeed;
+        if (out < -liftMaxSpeed) out = -liftMaxSpeed;
+
+        liftMotors.move(-1*out);
+
+
+        if(fabs(err)<30||cascadeOverride==true){
+    stable += 10;
+
+    if(stable >= 150||cascadeOverride==true){
+
+        liftMotors.brake();
+        liftRunning=false;
+        pinPrime=false;
+
+        return;
+    }
+
+}else{
+    stable=0;
+}
+
+        pros::delay(10);
+    }
+
+    liftMotors.set_brake_mode(pros::MotorBrake::hold);
+    liftMotors.brake();
+    liftRunning = false;
+}
+
+
+void driverMoveLiftTo(int pos, int maxSpeed) {
+    liftTarget = pos;
+    liftMaxSpeed = maxSpeed;
+
+    if (liftRunning && liftTask != nullptr) {
+        liftTask->remove();      // stop the task
+        delete liftTask;         // free memory
+        liftTask = nullptr;
+        liftRunning = false;
+    }
+
+    liftTask = new pros::Task(driverLiftTaskFn);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+bool pickUp = false;
+    bool autoraise=false;
+
+
+
+
+
+
+
+bool autonRunning=false;
+bool lowerRequested = false;
+double currentPos;
+bool resetLowerRequest=false;
+bool liftAuto = false;
+
+
+void lowerTask(void*) {
+    while (true) {
+        if (lowerRequested==true) {
+            liftAuto = true;
+            clamp.set_value(true);
+            clampValue = true;
+            pros::delay(150);
+            currentPos=leftLift.get_position() + 500;
+            moveLiftTo(leftLift.get_position() + 500, 127);
+            pros::delay(500);
+            moveChainTo(220, 127);
+            pros::delay(900);
+            pickUp = true;
+            moveLiftTo(0, 127);
+            pros::delay(600);
+            
+            lowerRequested = false;
+            liftAuto = false;
+        }else if (resetLowerRequest == true) {
+    liftlowering = true;
+
+    liftAfterChain = true;
+    moveChainTo(0, 127);
+
+    resetLowerRequest = false;
+    liftlowering = false;
+}else if(autoraise==true&&leftLift.get_position()<500){
+            pros::delay(150);
+            
+            moveChainTo(leftChain.get_position()+170, 80);
+            
+            autoraise=false;
+        }/*else if(chainRunning==false&&autonRunning==true){
+            chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+            chainBarMotor.brake();
+        }*/
+        pros::delay(10);
+    }
+}
+bool autoClamp=false;
+bool autoClampRaise=false;
+int Ldistance=0;
+int Rdistance=0;
+
+bool clampRunning=false;
+
+void autoClampTask(void*){
+    while(true){
+        if(autoClamp==true){
+            if(leftAutoClampDistance.get_distance()<Ldistance|| RightAutoClampDistance.get_distance()<Rdistance){
+                clamp.set_value(false);
+                if(autoClampRaise==true){
+                pros::delay(200);
+                chainBarMotor.move(25);
+                pros::delay(200);
+                chainBarMotor.move(0);
+                autoClampRaise=false;
+                }
+            }
+
+        }
+        pros::delay(10);
+    }
+}
+void autoClampFunction(int Ldist, int Rdist) {
+    Ldistance=Ldist;
+    Rdistance=Rdist;
+    if (clampRunning && clampTask != nullptr) {
+        clampTask->remove();      // stop the task
+        delete clampTask;         // free memory
+        clampTask = nullptr;
+        clampRunning = false;
+    }
+    clampTask = new pros::Task(autoClampTask);
+}
+
+
+//
+//
+//
+//HORIZONTAL TURN OFF FOR SKILLS AND ON FOR MATCH
+//
+int auton =11; 
+//std::atomic<bool> lowerRequested = false;
+
+//
+//
+//
+//
+//
+//Auton selector
+std::string autonName="";
+void on_center_button() {
+  pros::lcd::clear_line(1);
+  pros::lcd::print(1, "Auton %d selected!", autonName);
+}
+
+void on_left_button() {
+  auton--;
+  if (auton < 0) auton = 9;
+  pros::lcd::clear_line(0);
+  pros::lcd::print(0, "Auton: %s", autonName);
+}
+
+void on_right_button() {
+  auton++;
+  if (auton > 9) auton = 0;
+  pros::lcd::clear_line(0);
+  pros::lcd::print(0, "Auton: %s", autonName);
+}
+
+void initialize() {
+    pros::lcd::initialize(); // initialize brain screen
+    chassis.calibrate(); // calibrate sensors
+    chainBarMotor.set_zero_position(0);
+    liftMotors.set_zero_position(0);
+    pros::Task autoClampHandle(autoClampTask);
+
+    
+    
+    
+  // initialize brain screen
+            if(auton==0){
+                autonName = "40 aliance Driver";
+            }else if(auton==1){
+                autonName= "50 nutral driver";
+            }else if(auton==2){
+                autonName= "50 solo";
+            }else if(auton==3){
+                autonName= "Rush";
+            }else if(auton==4){
+                autonName= "Skills";
+            }else if(auton==5){
+                autonName = "split";
+            }else if(auton==6){
+                autonName= "other Rush";
+            }else if(auton==7){
+                autonName= "other 40 aliance";
+            }else if(auton==8){
+                autonName= "other split";
+            }else if(auton==9){
+                autonName= "All line Driver";
+            }else if(auton==10){
+                autonName= "All wall Driver";
+            }else if(auton==11){
+                autonName= "sig solo";
+            }else if(auton==12){
+                autonName= "All wall other";
+            }else if(auton==13){
+                autonName="30 point";
+
+            }
+   pros::lcd::print(0, "Select Auton: %s", autonName);
+  
+  pros::lcd::register_btn0_cb(on_left_button);
+  pros::lcd::register_btn2_cb(on_right_button);
+   
+    pros::Task screenTask([&]() {
+        while (true) {
+            
+            
+            if(auton==0){
+                autonName = "40 aliance Driver";
+            }else if(auton==1){
+                autonName= "50 nutral driver";
+            }else if(auton==2){
+                autonName= "50 solo";
+            }else if(auton==3){
+                autonName= "Rush";
+            }else if(auton==4){
+                autonName= "Skills";
+            }else if(auton==5){
+                autonName = "split";
+            }else if(auton==6){
+                autonName= "other Rush";
+            }else if(auton==7){
+                autonName= "other 40 aliance";
+            }else if(auton==8){
+                autonName= "other split";
+            }else if(auton==9){
+                autonName= "All line Driver";
+            }else if(auton==10){
+                autonName= "All wall Driver";
+            }else if(auton==11){
+                autonName= "sig solo";
+            }else if(auton==13){
+                autonName="30 point";
+
+            }
+               
+        
+               
+            
+              
+            pros::lcd::clear_line(0);
+            pros::lcd::print(3, "Auton: %s", autonName);
+       
+            controller.print(0, 0, "Auton: %s", autonName);
+
+            pros::lcd::print(0, "X: %f", chassis.getPose().x); 
+            pros::lcd::print(1, "Y: %f", chassis.getPose().y); 
+            pros::lcd::print(2, "Theta: %f", chassis.getPose().theta); 
+            
+           // pros::lcd::print(5, "horizontal: %i", horizontalEnc.get_position());
+            pros::lcd::print(6, "vertical: %i",verticalEnc.get_position());
+            //pros::lcd::print(5, "Lift Position: %i", liftMotor.get_position());     
+
+                
+
+            lemlib::telemetrySink()->info("Chassis pose: {}", chassis.getPose());
+            // delay to save resources
+            pros::delay(50);
+        }
+    });
+}
+
+/**
+ * Runs while the robot is disabled
+ */
+void disabled() {}
+
+/**
+ * runs after initialize if the robot is connected to field control
+ */
+void competition_initialize() {}
+
+
+ASSET(example_txt); 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+bool rakeValue = false;
+bool primeH=false;
+
+
+/**
+ * Runs during auto
+ *
+ * This is an example autonomous routine which demonstrates a lot of the features LemLib has to offer
+ */
+void autonomous() {
+    chainBarMotor.set_zero_position(0);
+
+    autonRunning=true;
+if(auton==0){
+
+
+    chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,132);
+    chassis.moveToPoint(-8, 6, 800,{.forwards=false,.minSpeed=60,.earlyExitRange=0.2});
+    moveChainTo(1200, 127);
+    chassis.turnToHeading(180, 300,{.earlyExitRange=2});
+    //pros::delay(600);
+    chassis.moveToPoint(-8.7,-7,600,{.minSpeed=50});
+    chassis.moveToPoint(-8.7, 3, 500,{.forwards=false,.minSpeed=60});
+    chassis.moveToPoint(-8.7, -4, 700,{.minSpeed=60});
+    pros::delay(500);
+
+    double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+    chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,-0.75,180);
+
+    chassis.moveToPoint(-19,13,900,{.forwards=false,.minSpeed=60,.earlyExitRange=0.05});
+    chassis.turnToHeading(90, 400,{.earlyExitRange=0.5});
+    chassis.waitUntilDone();
+    double distanceIn= distance_Right.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-89)*(M_PI/180);
+    double yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(-6, 24.15, 1000,{.minSpeed=40,.earlyExitRange=0.25});
+
+    moveChainTo(0, 127);
+    moveLiftTo(650, 127);
+    pros::delay(800);
+    moveChainTo(0, 30);
+    moveLiftTo(305, 80);
+    pros::delay(250);
+    clamp.set_value(true);
+    chassis.turnToHeading(80, 150,{.minSpeed=10});
+    chassis.turnToHeading(100, 150,{.minSpeed=10});
+
+    chassis.moveToPoint(-20, 16, 800,{.forwards=false,.minSpeed=50,.earlyExitRange=0.05});
+    //moveChainTo(225, 127);
+    chassis.turnToHeading(90, 400,{.earlyExitRange=2});
+    chassis.waitUntilDone();
+     distanceIn= distance_Right.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-89.5)*(M_PI/180);
+     yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(9, 13.8, 1400,{.maxSpeed=90,.earlyExitRange=0.5});
+    moveLiftTo(0,60);
+    moveChainTo(0, 127);
+
+    chassis.turnToHeading(47, 350);
+    moveChainTo(240, 127);
+    chassis.moveToPoint(17.3, 20.2, 700,{.maxSpeed=90});
+    pros::delay(650);
+    clamp.set_value(false);
+    pros::delay(200);
+
+    moveChainTo(2150, 40);
+    moveLiftTo(0, 127);
+    chassis.turnToHeading(75, 300,{.earlyExitRange=1});
+    chassis.moveToPoint(3, 16.3, 600,{.forwards=false,.minSpeed=30,.earlyExitRange=0.05});
+    chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+    chassis.swingToHeading(181.5, lemlib::DriveSide::LEFT, 500);
+    pros::delay(200);
+    moveChainTo(2400, 48);
+    pros::delay(500);
+    clamp.set_value(true);
+chassis.moveToPoint(chassis.getPose().x-1, chassis.getPose().y+10, 250,{.forwards=false,.minSpeed=60});
+
+chassis.waitUntilDone();
+thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,8,chassis.getPose().theta);
+
+pros::delay(50);
+moveChainTo(0, 127);
+moveLiftTo(0, 127);
+pros::delay(450);
+chassis.moveToPoint(0, 1, 700,{.minSpeed=30});
+moveChainTo(225, 127);
+
+pros::delay(500);
+chainBarMotor.move(-50);
+pros::delay(250);
+clamp.set_value(false);
+moveChainTo(50,127);
+chassis.turnToHeading(193, 170,{.minSpeed=30});
+chassis.turnToHeading(170, 230,{.minSpeed=30});
+pros::delay(230);
+chainBarMotor.move(0);
+moveChainTo(2300, 100);
+chassis.moveToPoint(-0.5, 15, 1000,{.forwards=false,.minSpeed=30});
+moveLiftTo(500, 127);
+pros::delay(1000);
+pros::delay(250);
+
+/*chassis.setPose(0,0,0);
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+liftMotors.brake();
+moveChainTo(500,127);
+chassis.turnToHeading(320, 400,{.earlyExitRange=2});
+chassis.moveToPoint(-9.7,10.7,1000);
+pros::delay(700);
+moveChainTo(150, 127);
+pros::delay(300);
+clamp.set_value(true);
+
+
+pros::delay(200);
+chassis.moveToPoint(-0.5,5, 600,{.forwards=false,.minSpeed=40});
+pros::delay(300);
+moveChainTo(0, 127);
+moveLiftTo(0, 127);
+chassis.turnToHeading(38, 400,{.earlyExitRange=2});
+moveChainTo(215, 127);
+chassis.moveToPoint(3.5, 9.8 , 1000,{.minSpeed=30});
+pros::delay(370);
+clamp.set_value(false);
+
+
+pros::delay(250);
+moveChainTo(1500, 127);
+//chassis.turnToHeading(75, 500,{.earlyExitRange=2});
+chassis.moveToPoint(- 7.5, 7, 700,{.forwards=false});
+chassis.swingToHeading(182, lemlib::DriveSide::LEFT, 900);
+pros::delay(500);
+moveChainTo(2400, 40);
+chassis.waitUntilDone();
+chassis.setBrakeMode(pros::E_MOTOR_BRAKE_BRAKE);
+
+chassis.arcade(-60,0);
+clamp.set_value(true);
+chassis.arcade(0,0);
+double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,8,chassis.getPose().theta);
+pros::delay(250);
+chassis.turnToHeading(183, 400);
+moveChainTo(0, 127);
+pros::delay(700);
+moveLiftTo(0, 127);
+moveChainTo(220, 127);
+
+chassis.moveToPoint(-2, 2.5, 800,{.minSpeed=20,.earlyExitRange=0.05});
+chassis.turnToHeading(182, 250);
+clamp.set_value(false);
+moveChainTo(100,127);
+chassis.turnToHeading(194, 350,{.minSpeed=30});
+chassis.turnToHeading(170, 300,{.minSpeed=30});
+pros::delay(300);
+
+moveChainTo(1700, 40);
+chassis.moveToPoint(-0.5, 15, 1000,{.forwards=false,.minSpeed=30});
+pros::delay(200);
+moveLiftTo(500, 127);
+moveChainTo(2320, 50);
+pros::delay(1000);
+clamp.set_value(true);
+
+pros::delay(250);
+moveLiftTo(700, 127);
+pros::delay(300);
+moveChainTo(0, 127);
+pros::delay(700);
+moveLiftTo(0, 127);
+chassis.moveToPoint(10, 8, 900,{.minSpeed=50,.earlyExitRange=0.2});
+chassis.turnToHeading(90, 550,{.earlyExitRange=2});
+chassis.moveToPoint(-18, 8, 1000,{.forwards=false,.minSpeed=80,.earlyExitRange=0.2});
+chassis.turnToHeading(180, 500,{.earlyExitRange=2});
+clamp.set_value(false);
+chassis.moveToPoint(-19.5, -6, 500,{.minSpeed=40,.earlyExitRange=0.5});
+chassis.moveToPoint(-19.5, 9, 500,{.forwards=false,.minSpeed=70,.earlyExitRange=1});
+chassis.moveToPoint(-19.5, -6, 500,{.minSpeed=40,.earlyExitRange=0.5});
+chassis.moveToPoint(-42, 15, 1000,{.forwards=false,.minSpeed=60,.earlyExitRange=1});
+
+chassis.waitUntilDone();
+leftMotors.move(24);
+rightMotors.move(-127);
+pros::delay(900);
+chassis.arcade(0, 0);*/
+
+
+}else if(auton==1){
+    chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+liftMotors.brake();
+    chassis.setPose(0,0,131);
+    chassis.swingToHeading(183, lemlib::DriveSide::LEFT, 750,{.minSpeed=40,.earlyExitRange=2});
+    moveChainTo(1100, 127);
+    chassis.moveToPoint(-2.4, -6, 350,{.minSpeed=50});
+    chassis.moveToPoint(-2.4, 2.5, 350,{.forwards=false,.minSpeed=70,.earlyExitRange=.5});
+    chassis.moveToPoint(-2.4, -4, 450,{.minSpeed=70});
+    chassis.moveToPoint(-0,9, 800,{.forwards=false,.minSpeed=60,.earlyExitRange=1});
+    moveLiftTo(500, 127);
+    pros::delay(200);
+    moveChainTo(-50,127);
+    chassis.turnToHeading(90, 370,{.minSpeed=20,.earlyExitRange=2});
+    chassis.moveToPoint(9, 13, 800,{.minSpeed=60,.earlyExitRange=1});
+    pros::delay(470);
+    moveLiftTo(270, 127);
+    pros::delay(150);
+    clamp.set_value(true);
+    pros::delay(200);
+    moveLiftTo(600, 127);
+    chassis.moveToPoint(0, 17, 800,{.forwards=false,.minSpeed=60,.earlyExitRange=1});
+    chassis.turnToHeading(45, 350,{.minSpeed=20,.earlyExitRange=2});
+    moveLiftTo(0, 127);
+    moveChainTo(235, 127);
+    chassis.moveToPoint(8, 28, 700,{.minSpeed=60,.earlyExitRange=0.5});
+    pros::delay(550);
+    clamp.set_value(false);
+    chassis.turnToHeading(355, 400,{.minSpeed=30,.earlyExitRange=2});
+    moveChainTo(2400, 50);
+    chassis.moveToPoint(13, 10, 700,{.forwards=false,.minSpeed=50,.earlyExitRange=0.5});
+    pros::delay(900);
+    clamp.set_value(true);
+    pros::delay(200);
+    moveChainTo(0, 127);
+    pros::delay(400);
+    chassis.moveToPoint(13, 22, 600,{.minSpeed=50,.earlyExitRange=0.1});
+    chassis.turnToHeading(110, 500,{.minSpeed=30,.earlyExitRange=2});
+    chassis.moveToPoint(28, 14.5, 900,{.minSpeed=50,.earlyExitRange=0.1});
+    moveChainTo(225, 127);
+    pros::delay(830);
+    clamp.set_value(false);
+    pros::delay(200);
+    moveChainTo(1500, 40);
+    chassis.turnToHeading(30, 450);
+    chassis.moveToPoint(11, 3, 600,{.forwards=false,.minSpeed=50});
+    moveLiftTo(420, 127);
+    chassis.swingToHeading(179, lemlib::DriveSide::LEFT, 750,{.minSpeed=22,.earlyExitRange=2});
+    pros::delay(700);
+    chassis.arcade(-60, 0);
+    moveChainTo(2200, 40);
+    pros::delay(300);
+    clamp.set_value(true);
+    chassis.arcade(0, 0);
+    pros::delay(200);
+moveLiftTo(800, 127);
+pros::delay(300);
+moveChainTo(0, 127);
+pros::delay(400);
+moveLiftTo(0, 127);
+pros::delay(400);
+double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,8,chassis.getPose().theta);
+moveChainTo(220, 127);
+chassis.moveToPoint(-1, 2, 600,{.minSpeed=50,.earlyExitRange=0.5});
+moveChainTo(220, 127);
+pros::delay(450);
+clamp.set_value(false);
+moveChainTo(80, 127);
+chassis.turnToHeading(168, 300,{.minSpeed=30,.earlyExitRange=2});
+chassis.turnToHeading(190, 300,{.minSpeed=30,.earlyExitRange=2});
+pros::delay(300);
+moveChainTo(1500, 40);
+chassis.moveToPoint(0, 15, 800,{.forwards=false,.minSpeed=50,.earlyExitRange=0.5});
+moveLiftTo(900, 127);
+pros::delay(400);
+moveChainTo(2000, 55);
+    
+
+
+
+
+}else if(auton==2){
+chassis.setPose(0,0,0);
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+liftMotors.brake();
+moveLiftTo(500, 127);
+moveChainTo(0, 127);
+chassis.turnToHeading(320, 350,{.earlyExitRange=2});
+chassis.moveToPoint(-12.3,14,700,{.minSpeed=25});
+pros::delay(750);
+moveLiftTo(270, 127);
+pros::delay(300);
+clamp.set_value(true);
+pros::delay(250);
+chassis.moveToPoint(-0.5,5, 600,{.forwards=false,.minSpeed=40,.earlyExitRange=0.1});
+pros::delay(300);
+moveChainTo(0, 127);
+moveLiftTo(0, 127);
+chassis.turnToHeading(38, 400,{.earlyExitRange=2});
+moveChainTo(220, 127);
+chassis.moveToPoint(3.5, 9.8 , 1000,{.minSpeed=30});
+pros::delay(450);
+clamp.set_value(false);
+
+pros::delay(150);
+moveChainTo(2350, 40);
+chassis.turnToHeading(105, 500,{.earlyExitRange=2});
+chassis.moveToPoint(-12 , 11.5, 1000,{.forwards=false,.minSpeed=60});
+pros::delay(850);
+clamp.set_value(true);
+pros::delay(200);
+
+moveChainTo(1500, 127);
+pros::delay(100);
+chassis.moveToPoint(-3, 2, 700,{.minSpeed=30,.earlyExitRange=0.5});
+chassis.turnToHeading(90, 350);
+moveLiftTo(0, 127);
+chassis.moveToPoint(-31.5,5,1000,{.forwards=false,.minSpeed=70,.earlyExitRange=0.5});
+chassis.turnToHeading(182, 400);
+chassis.moveToPoint(-34, -5, 500,{.minSpeed=60});
+chassis.moveToPoint(-34, 6, 500,{.forwards=false,.minSpeed=60});
+chassis.moveToPoint(-34, -5, 650,{.minSpeed=70});
+
+pros::delay(600);
+double thetaReset = (chassis.getPose().theta-179.5)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,0,chassis.getPose().theta);
+
+chassis.moveToPoint(-19.5, 21, 1000,{.forwards=false,.minSpeed=60,.earlyExitRange=0.5});
+moveChainTo(0, 127);
+chassis.turnToHeading(45, 450);
+chassis.moveToPoint(-1, 38, 800,{.minSpeed=30,.earlyExitRange=0.1});
+moveChainTo(225, 127);
+pros::delay(570);
+clamp.set_value(false);
+
+pros::delay(200);
+moveChainTo(1400, 60);
+chassis.moveToPoint(25, 60, 1500,{.minSpeed=50,.earlyExitRange=0.5});
+chassis.turnToHeading(93, 350);
+chassis.moveToPoint(45, 61.5, 800,{.minSpeed=50});
+chassis.moveToPoint(33, 61.5, 500,{.forwards=false,.minSpeed=50});
+chassis.moveToPoint(45, 61.5, 500,{.minSpeed=60});
+chassis.moveToPoint(29, 89, 1500,{.forwards=false,.minSpeed=100});
+pros::delay(500);
+moveChainTo(2300, 20);
+}else if(auton==3){
+    chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,132);
+    chassis.moveToPoint(-30, 32, 1000,{.forwards=false,.minSpeed=80,.earlyExitRange=1});
+    Rake.set_value(true);
+    moveChainTo(300, 127);
+
+    chassis.moveToPoint(-8, 8, 1000,{.minSpeed=40});
+    pros::delay(600);
+    moveChainTo(1200, 127);
+    chassis.moveToPoint(-9,-12,600,{.minSpeed=50});
+    chassis.moveToPoint(-9, 3, 500,{.forwards=false,.minSpeed=60});
+    Rake.set_value(false);
+    chassis.moveToPoint(-9, -12, 700,{.minSpeed=60});
+     pros::delay(500);
+
+    double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+    chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,-0.75,180);
+
+    chassis.moveToPoint(-19,13,900,{.forwards=false,.minSpeed=60,.earlyExitRange=0.05});
+    chassis.turnToHeading(90, 400,{.earlyExitRange=0.5});
+    chassis.waitUntilDone();
+    double distanceIn= distance_Right.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-89)*(M_PI/180);
+    double yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(-6, 24, 1000,{.minSpeed=40,.earlyExitRange=0.25});
+
+    moveChainTo(0, 127);
+    moveLiftTo(650, 127);
+    pros::delay(800);
+    moveChainTo(0, 30);
+    moveLiftTo(305, 80);
+    pros::delay(250);
+    clamp.set_value(true);
+    chassis.turnToHeading(80, 150,{.minSpeed=10});
+    chassis.turnToHeading(100, 150,{.minSpeed=10});
+
+    chassis.moveToPoint(-20, 16, 800,{.forwards=false,.minSpeed=50,.earlyExitRange=0.05});
+    //moveChainTo(225, 127);
+    chassis.turnToHeading(90, 400,{.earlyExitRange=2});
+    chassis.waitUntilDone();
+     distanceIn= distance_Right.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-89.5)*(M_PI/180);
+     yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(9, 13.8, 1400,{.maxSpeed=90,.earlyExitRange=0.5});
+    moveLiftTo(0,60);
+    moveChainTo(0, 127);
+
+    chassis.turnToHeading(47, 350);
+    moveChainTo(240, 127);
+    chassis.moveToPoint(17.3, 19.6, 700,{.maxSpeed=90});
+    pros::delay(650);
+    clamp.set_value(false);
+    pros::delay(200);
+
+    moveChainTo(2150, 40);
+    moveLiftTo(0, 127);
+    chassis.turnToHeading(75, 300,{.earlyExitRange=1});
+    chassis.moveToPoint(3, 16.6, 600,{.forwards=false,.minSpeed=30,.earlyExitRange=0.05});
+    chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+    chassis.swingToHeading(181.5, lemlib::DriveSide::LEFT, 500);
+    pros::delay(200);
+    moveChainTo(2400, 48);
+    pros::delay(500);
+    clamp.set_value(true);
+chassis.moveToPoint(chassis.getPose().x-1, chassis.getPose().y+10, 250,{.forwards=false,.minSpeed=60});
+
+chassis.waitUntilDone();
+thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,8,chassis.getPose().theta);
+
+pros::delay(50);
+moveChainTo(0, 127);
+moveLiftTo(0, 127);
+pros::delay(450);
+chassis.moveToPoint(0, 1, 700,{.minSpeed=30});
+moveChainTo(225, 127);
+
+pros::delay(500);
+chainBarMotor.move(-50);
+pros::delay(250);
+clamp.set_value(false);
+moveChainTo(50,127);
+chassis.turnToHeading(193, 170,{.minSpeed=30});
+chassis.turnToHeading(170, 230,{.minSpeed=30});
+pros::delay(230);
+chainBarMotor.move(0);
+moveChainTo(2300, 100);
+chassis.moveToPoint(-0.5, 15, 1000,{.forwards=false,.minSpeed=30});
+moveLiftTo(500, 127);
+pros::delay(1000);
+}else if(auton==4){
+
+
+
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,132);
+    chassis.moveToPoint(-8, 6, 800,{.forwards=false,.minSpeed=60,.earlyExitRange=0.2});
+    moveChainTo(1200, 127);
+    chassis.turnToHeading(180, 300,{.earlyExitRange=2});
+    //pros::delay(600);
+    chassis.moveToPoint(-8.7,-7,600,{.minSpeed=50});
+    chassis.moveToPoint(-9, 3, 500,{.forwards=false,.minSpeed=60});
+    chassis.moveToPoint(-8.7, -4, 700,{.minSpeed=60});
+    pros::delay(650);
+
+    double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+    chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,-0.75,180);
+
+    chassis.moveToPoint(-19,13,900,{.forwards=false,.minSpeed=60,.earlyExitRange=0.5});
+    chassis.turnToHeading(90, 500);
+    chassis.waitUntilDone();
+    double distanceIn= distance_Right.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-90)*(M_PI/180);
+    double yValue=(distanceIn * std::cos(thetaReset))+5.25;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(0, 23.9, 1000,{.minSpeed=40,.earlyExitRange=0.25});
+    moveChainTo(0, 127);
+    moveLiftTo(650, 127);
+    pros::delay(650);
+    moveChainTo(0, 30);
+    moveLiftTo(280, 80);
+    pros::delay(350);
+    clamp.set_value(true);
+    chassis.turnToHeading(100, 180,{.minSpeed=10});
+    chassis.turnToHeading(80, 180,{.minSpeed=10});
+    pros::delay(180);
+
+    chassis.moveToPose(-24, 24,90, 1000,{.forwards=false,.maxSpeed=90});
+    pros::delay(400);
+    moveLiftTo(0, 127);
+    chassis.waitUntilDone();
+    distanceIn= distance_Right.get_distance()/25.4;
+const double yZero=470/25.4;
+ thetaReset = (chassis.getPose().theta-89)*(M_PI/180);
+ yValue=(yZero - distanceIn * std::cos(thetaReset))*-1;
+chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+chassis.turnToHeading(40, 400);
+moveLiftTo(293, 100);
+moveChainTo(0,60);
+autoClamp=true;
+autoClampRaise=true;
+autoClampFunction(44,45);
+chassis.moveToPoint(-0.9,22,800,{.maxSpeed=80});
+
+pros::delay(920);
+//clamp.set_value(false);
+pros::delay(300);
+clamp.set_value(false);
+autoClamp=false;
+moveChainTo(2350,55);
+pros::delay(150);
+chassis.turnToHeading(350, 400);
+moveLiftTo(0, 127);
+moveChainTo(2350,55);
+pros::delay(200);
+chassis.moveToPoint(1, -5, 900,{.forwards=false,.minSpeed=35});
+pros::delay(800);
+clamp.set_value(true);
+pros::delay(250);
+moveLiftTo(100, 127);
+moveChainTo(0, 127);
+pros::delay(275);
+chassis.moveToPoint(0,20,600,{.maxSpeed=90});
+
+chassis.turnToHeading(123, 450);
+moveLiftTo(0, 127);
+chassis.moveToPoint(19.5, 2,750,{.maxSpeed=80});
+moveLiftTo(285, 80);
+moveChainTo(0,127);
+autoClampFunction(47,48);
+autoClamp=true;
+autoClampRaise=true;
+chassis.moveToPoint(22.5,0.15, 1000,{.maxSpeed=25});
+
+pros::delay(535);
+//clamp.set_value(false);
+pros::delay(250);
+chassis.waitUntilDone();
+clamp.set_value(false);
+chassis.turnToHeading(75, 400);
+autoClamp=false;
+moveChainTo(1500,90);
+moveLiftTo(0, 127);
+chassis.moveToPoint(-2, -0.5, 700,{.forwards=false,.minSpeed=45});
+moveLiftTo(400,127);
+pros::delay(500);
+moveChainTo(2250,45);
+pros::delay(470);
+clamp.set_value(true);
+pros::delay(150);
+moveLiftTo(700, 127);
+pros::delay(300);
+moveChainTo(0,127);
+pros::delay(650);
+moveLiftTo(0,127);
+pros::delay(200);
+chassis.moveToPoint(32.5, 1, 1100,{.minSpeed=30,.earlyExitRange=0.1});
+chassis.turnToHeading(90,400,{.minSpeed=8});
+chassis.waitUntilDone();
+distanceIn= distance_Right.get_distance()/25.4;
+thetaReset = (chassis.getPose().theta-90)*(M_PI/180);
+yValue=(yZero - distanceIn * std::cos(thetaReset))*-1;
+chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+chassis.turnToHeading(180, 500,{.maxSpeed=90});
+moveChainTo(225, 127);
+chassis.waitUntilDone();
+double thetaReset2 = (chassis.getPose().theta-179.5)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset2))/25.4,chassis.getPose().y,chassis.getPose().theta);
+moveChainTo(233, 60);
+chassis.moveToPoint(34.9, -13.7, 1100);
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+pros::delay(560);
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+pros::delay(375);
+clamp.set_value(false);
+chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+chassis.cancelAllMotions();
+
+pros::delay(250);
+moveChainTo(chainBarMotor.get_position()+50, 127);
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+chassis.moveToPoint(31.8, -1, 1700,{.forwards=false,.minSpeed=70,.earlyExitRange=1});
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+moveChainTo(400, 127);
+chassis.turnToHeading(90, 350,{.minSpeed=40,.earlyExitRange=2});
+moveChainTo(400, 127);
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+chassis.moveToPoint(-2, 2.5, 1000,{.forwards=false,.minSpeed=40});
+moveLiftTo(900, 127);
+pros::delay(500);
+moveChainTo(2000, 65);
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+pros::delay(1000);
+clamp.set_value(true);
+pros::delay(250);
+moveLiftTo(leftLift.get_position() + 500, 127);
+pros::delay(350);
+moveChainTo(0, 127);
+pros::delay(700);
+moveLiftTo(0, 127);
+pros::delay(400);
+chassis.moveToPoint(32.2, 0, 1100,{.minSpeed=50,.earlyExitRange=0.2});
+chassis.turnToHeading(90, 200,{.minSpeed=9});
+chassis.waitUntilDone();
+distanceIn= distance_Right.get_distance()/25.4;
+thetaReset = (chassis.getPose().theta-89.5)*(M_PI/180);
+yValue=(yZero - distanceIn * std::cos(thetaReset))*-1;
+chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+chassis.turnToHeading(180, 480,{.maxSpeed=90});
+moveChainTo(232, 127);
+chassis.waitUntilDone();
+thetaReset2 = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset2))/25.4,chassis.getPose().y,chassis.getPose().theta);
+moveChainTo(247, 60);
+chassis.moveToPoint(35, -13.47, 1100);
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+pros::delay(560);
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+pros::delay(375);
+clamp.set_value(false);
+chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+chassis.cancelAllMotions();
+
+moveChainTo(180, 127);
+pros::delay(250);
+moveChainTo(320, 127);
+chassis.moveToPoint(32, -1, 1700,{.forwards=false,.minSpeed=70,.earlyExitRange=1});
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+chassis.turnToHeading(90, 450,{.minSpeed=40,.earlyExitRange=2});
+moveChainTo(400, 127);
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+chassis.moveToPoint(-5, 2.5, 1000,{.forwards=false,.minSpeed=30});
+moveLiftTo(1600, 127);
+pros::delay(200);
+moveChainTo(1840, 40);
+pros::delay(1400);
+moveLiftTo(1420, 127);
+pros::delay(200);
+clamp.set_value(true);
+pros::delay(200);
+moveLiftTo(1900, 127);
+pros::delay(350);
+moveChainTo(0, 127);
+pros::delay(700);
+moveLiftTo(0, 127);
+pros::delay(600);
+chassis.moveToPoint(42.7, 0, 800,{.earlyExitRange=0.5});
+chassis.turnToHeading(91.5, 450,{.minSpeed=10});
+pros::delay(300);
+distanceIn= distance_Right.get_distance()/25.4;
+thetaReset = (chassis.getPose().theta-89.5)*(M_PI/180);
+yValue=(yZero - distanceIn * std::cos(thetaReset))*-1;
+chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+chassis.turnToHeading(180, 500);
+pros::delay(470);
+thetaReset2 = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset2))/25.4,chassis.getPose().y,chassis.getPose().theta);
+chassis.moveToPoint(34.95, -16.6, 900,{.maxSpeed=90});
+moveChainTo(-5, 60);
+moveLiftTo(38,127);
+pros::delay(1270);
+clamp.set_value(false);  
+chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+chassis.cancelAllMotions();
+
+pros::delay(400);
+chassis.moveToPoint(36, -5, 450,{.forwards=false,.maxSpeed=80,.earlyExitRange=0.1});
+chassis.moveToPoint(21.5, 10, 750,{.forwards=false,.maxSpeed=80});
+moveChainTo(300, 127);
+chassis.turnToHeading(0, 550,{.maxSpeed=80});
+chassis.waitUntilDone();
+thetaReset2 = (chassis.getPose().theta-0)*(M_PI/180);
+chassis.setPose((1080 - distance_Right.get()*std::cos(thetaReset2))/25.4,chassis.getPose().y,chassis.getPose().theta);
+pros::delay(50);
+chassis.moveToPoint(23.1,28 , 1100,{.minSpeed=35});
+moveLiftTo(650, 127);
+moveChainTo(0,60);
+pros::delay(800);
+moveChainTo(0, 30);
+moveLiftTo(270, 80);
+thetaReset2 = (chassis.getPose().theta-0)*(M_PI/180);
+chassis.setPose((1080 - distance_Right.get()*std::cos(thetaReset2))/25.4,chassis.getPose().y,chassis.getPose().theta);
+pros::delay(250);
+clamp.set_value(true);
+pros::delay(200);
+chassis.turnToHeading(12, 180,{.minSpeed=10});
+chassis.turnToHeading(348, 180,{.minSpeed=10});
+pros::delay(180);
+chassis.moveToPoint(28.5, 3, 700,{.forwards=false});
+chassis.turnToHeading(52, 370);
+moveLiftTo(0,127);
+chassis.moveToPoint(34.25, 24, 700,{.minSpeed=40,.earlyExitRange=0.2});
+chassis.moveToPoint(32.5, 41, 700,{.minSpeed=40,.earlyExitRange=0.2});
+chassis.turnToHeading(90, 400);
+chassis.moveToPoint(50,41.5, 600,{.minSpeed=40});
+chainBarMotor.move(-30);
+pros::delay(450);
+chainBarMotor.set_zero_position(0);
+chassis.moveToPoint(34, 44.5, 500,{.forwards=false,.minSpeed=40});
+chassis.moveToPoint(65,44.5, 800,{.minSpeed=45});
+pros::delay(770);
+distanceIn= distance_Right.get_distance()/25.4;
+thetaReset = (chassis.getPose().theta-89.5)*(M_PI/180);
+yValue=(yZero - distanceIn * std::cos(thetaReset))*-1;
+chassis.setPose(chassis.getPose().x,yValue,90);
+chassis.moveToPoint(34.75, 44, 500,{.forwards=false,.minSpeed=20});
+chassis.turnToHeading(180, 440);
+chassis.waitUntilDone();
+thetaReset2 = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset2))/25.4,chassis.getPose().y,chassis.getPose().theta);
+pros::delay(50);
+chassis.moveToPoint(34.8, -6, 1800,{.minSpeed=50,.earlyExitRange=0.05});
+moveChainTo(chainBarMotor.get_position()+300, 127);
+chassis.turnToHeading(180, 200);
+chassis.waitUntilDone();
+thetaReset2 = (chassis.getPose().theta-179.5)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset2))/25.4,chassis.getPose().y,chassis.getPose().theta);
+chassis.moveToPoint(34.8, -8.9, 1050,{.maxSpeed=60,.minSpeed=30,.earlyExitRange=0.05});
+pros::delay(500);
+clamp.set_value(false);
+chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+chassis.cancelAllMotions();
+
+
+ thetaReset2 = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset2))/25.4,chassis.getPose().y,chassis.getPose().theta);
+pros::delay(200);
+moveChainTo(chainBarMotor.get_position()+170, 127);
+chassis.moveToPoint(24.5,16,900,{.forwards=false,.minSpeed=40,.earlyExitRange=0.5});
+pros::delay(200);
+moveChainTo(2400, 50);
+chassis.moveToPoint(24.5,27,600,{.forwards=false,.minSpeed=40,.earlyExitRange=0.5});
+pros::delay(600);
+clamp.set_value(true);
+pros::delay(250);
+moveLiftTo(100, 127);
+pros::delay(200);
+moveChainTo(0, 127);
+chassis.moveToPoint(34.5,-4, 1200,{.minSpeed=40,.earlyExitRange=0.5});
+chassis.turnToHeading(180, 400);
+moveChainTo(295, 60);
+moveLiftTo(0, 127);
+chassis.waitUntilDone();
+thetaReset2 = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset2))/25.4,chassis.getPose().y,chassis.getPose().theta);
+chassis.moveToPoint(35.6, -9.05, 900,{.minSpeed=30,.earlyExitRange=0.05});
+pros::delay(500);
+clamp.set_value(false);
+chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+chassis.cancelAllMotions();
+
+
+pros::delay(200);
+moveChainTo(chainBarMotor.get_position()+150, 127);
+chassis.moveToPoint(24.5,16,900,{.forwards=false,.minSpeed=40,.earlyExitRange=0.5});
+pros::delay(400);
+moveChainTo(2160, 50);
+moveLiftTo(425, 127);
+chassis.moveToPoint(24.5,27,900,{.forwards=false,.minSpeed=40,.earlyExitRange=0.5});
+pros::delay(550);
+clamp.set_value(true);
+pros::delay(200);
+moveLiftTo(850, 127);
+pros::delay(350);
+moveChainTo(0, 127);
+pros::delay(550);
+moveLiftTo(0, 127);
+chassis.moveToPoint(34.5,-4, 1200,{.minSpeed=40,.earlyExitRange=0.2});
+chassis.turnToHeading(180, 400);
+moveLiftTo(0, 127);
+chassis.waitUntilDone();
+thetaReset2 = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset2))/25.4,chassis.getPose().y,chassis.getPose().theta);
+chassis.moveToPoint(35.6, -9.6, 900,{.minSpeed=30,.earlyExitRange=0.05});
+moveChainTo(287, 60);
+pros::delay(660);
+clamp.set_value(false);
+chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+chassis.cancelAllMotions();
+
+pros::delay(200);
+moveChainTo(chainBarMotor.get_position()+170, 127);
+chassis.moveToPoint(24.5,16,900,{.forwards=false,.minSpeed=40,.earlyExitRange=0.5});
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+pros::delay(500);
+moveLiftTo(900, 127);
+moveChainTo(2050, 50);
+chassis.moveToPoint(24.5,27,900,{.forwards=false,.minSpeed=40,.earlyExitRange=0.5});
+
+pros::delay(600);
+clamp.set_value(true);
+pros::delay(200);
+moveLiftTo(1200, 127);
+pros::delay(300);
+moveChainTo(0, 127);
+pros::delay(500);
+moveLiftTo(0, 127);
+chassis.moveToPoint(34.7,-4, 1200,{.minSpeed=40,.earlyExitRange=0.2});
+chassis.turnToHeading(180, 400);
+moveLiftTo(0, 127);
+chassis.waitUntilDone();
+thetaReset2 = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset2))/25.4,chassis.getPose().y,chassis.getPose().theta);
+chassis.moveToPoint(35.2, -12.5, 900,{.minSpeed=30,.earlyExitRange=0.05});
+pros::delay(800);
+clamp.set_value(false);
+moveChainTo(chainBarMotor.get_position()+100, 127);
+chassis.moveToPoint(-21, 47, 1200,{.forwards=false,.minSpeed=90});
+pros::delay(200);
+moveLiftTo(320,127);
+moveChainTo(1000, 90);
+chassis.waitUntilDone();
+chassis.arcade(-75, 0);
+pros::delay(400);
+//moveChainTo(2600, 40);
+pros::delay(1100);
+chassis.arcade(0, 0);
+
+
+
+
+
+
+
+
+}else if(auton==5){
+
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,132);
+    chassis.moveToPoint(-8, 6, 800,{.forwards=false,.minSpeed=60,.earlyExitRange=0.2});
+    moveChainTo(1200, 127);
+    chassis.turnToHeading(180, 300,{.earlyExitRange=2});
+    //pros::delay(600);
+    chassis.moveToPoint(-8.7,-7,600,{.minSpeed=50});
+    chassis.moveToPoint(-8.7, 2, 500,{.forwards=false,.minSpeed=60});
+    chassis.moveToPoint(-8.7, -4, 600,{.minSpeed=60});
+    pros::delay(500);
+
+    double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+    chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,-0.75,180);
+
+    chassis.moveToPoint(-19,13,900,{.forwards=false,.minSpeed=60,.earlyExitRange=0.05});
+    chassis.turnToHeading(90, 400,{.earlyExitRange=0.5});
+    chassis.waitUntilDone();
+    double distanceIn= distance_Right.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-89)*(M_PI/180);
+    double yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(-6, 24.15, 1000,{.minSpeed=40,.earlyExitRange=0.25});
+
+    moveChainTo(0, 127);
+    moveLiftTo(650, 127);
+    pros::delay(800);
+    moveChainTo(0, 30);
+    moveLiftTo(305, 80);
+    pros::delay(250);
+    clamp.set_value(true);
+    chassis.turnToHeading(80, 150,{.minSpeed=10});
+    chassis.turnToHeading(100, 150,{.minSpeed=10});
+
+    chassis.moveToPoint(-20, 16, 800,{.forwards=false,.minSpeed=50,.earlyExitRange=0.05});
+    //moveChainTo(225, 127);
+    chassis.turnToHeading(90, 400,{.earlyExitRange=2});
+    chassis.waitUntilDone();
+     distanceIn= distance_Right.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-89.5)*(M_PI/180);
+     yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(9, 13.8, 1400,{.maxSpeed=90,.earlyExitRange=0.5});
+    moveLiftTo(0,60);
+    moveChainTo(0, 127);
+
+    chassis.turnToHeading(47, 350);
+    moveChainTo(235, 127);
+     moveChainTo(240, 127);
+    chassis.moveToPoint(17.6, 21, 700,{.maxSpeed=90});
+    pros::delay(700);
+    clamp.set_value(false);
+    pros::delay(200);
+
+    moveChainTo(2150, 40);
+    moveLiftTo(0, 127);
+    chassis.turnToHeading(75, 300,{.earlyExitRange=1});
+    chassis.moveToPoint(3, 16.7, 600,{.forwards=false,.minSpeed=30,.earlyExitRange=0.05});
+    chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+    chassis.swingToHeading(180, lemlib::DriveSide::LEFT, 500);
+    pros::delay(200);
+    moveChainTo(2400, 48);
+    pros::delay(500);
+    clamp.set_value(true);
+chassis.moveToPoint(chassis.getPose().x-1, chassis.getPose().y+10, 250,{.forwards=false,.minSpeed=60});
+
+chassis.waitUntilDone();
+thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,8,chassis.getPose().theta);
+
+pros::delay(50);
+moveChainTo(0, 127);
+moveLiftTo(0, 127);
+pros::delay(450);
+chassis.moveToPoint(0, 1, 700,{.minSpeed=30});
+moveChainTo(225, 127);
+
+pros::delay(500);
+chainBarMotor.move(-50);
+pros::delay(250);
+clamp.set_value(false);
+moveChainTo(50,127);
+chassis.turnToHeading(193, 170,{.minSpeed=30});
+chassis.turnToHeading(170, 230,{.minSpeed=30});
+pros::delay(230);
+chainBarMotor.move(0);
+moveChainTo(1700, 100);
+chassis.moveToPoint(-0.8, 15, 600,{.forwards=false,.minSpeed=50});
+moveLiftTo(270, 127);
+chassis.swingToHeading(270, lemlib::DriveSide::RIGHT, 500,{.earlyExitRange=2});
+chassis.moveToPoint(-28, 11, 800,{.minSpeed=80,.earlyExitRange=0.5});
+chassis.turnToHeading(114, 400,{.earlyExitRange=2});
+chassis.moveToPoint(-49, 17, 1000,{.forwards=false,.minSpeed=80,.earlyExitRange=0.5});
+pros::delay(150);
+moveChainTo(2400, 10);
+
+
+/*chassis.setPose(0,0,0);
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+chainBarMotor.brake();
+liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+liftMotors.brake();
+moveChainTo(500,127);
+chassis.turnToHeading(320, 400,{.earlyExitRange=2});
+chassis.moveToPoint(-9.7,10.7,1000);
+pros::delay(700);
+moveChainTo(150, 127);
+pros::delay(300);
+clamp.set_value(true);
+
+pros::delay(200);
+chassis.moveToPoint(-0.5,5, 600,{.forwards=false,.minSpeed=40});
+pros::delay(300);
+moveChainTo(0, 127);
+moveLiftTo(0, 127);
+chassis.turnToHeading(38, 400,{.earlyExitRange=1});
+moveChainTo(200, 127);
+chassis.moveToPoint(3.7, 9.7 , 1000,{.minSpeed=30});
+pros::delay(375);
+clamp.set_value(false);
+
+pros::delay(250);
+moveChainTo(1500, 127);
+chassis.moveToPoint(- 7.5, 7, 700,{.forwards=false});
+chassis.swingToHeading(181, lemlib::DriveSide::LEFT, 600,{.earlyExitRange=1});
+chassis.waitUntilDone();
+chassis.setBrakeMode(pros::E_MOTOR_BRAKE_BRAKE);
+moveChainTo(2400, 50);
+
+chassis.arcade(-60,0);
+pros::delay(300);
+clamp.set_value(true);
+pros::delay(200);
+chassis.arcade(0,0);
+double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,8,chassis.getPose().theta);
+chassis.turnToHeading(182, 200);
+moveChainTo(0, 127);
+pros::delay(700);
+moveLiftTo(0, 127);
+moveChainTo(220, 127);
+
+chassis.moveToPoint(-2, 2.5, 800,{.minSpeed=20,.earlyExitRange=0.2});
+chassis.turnToHeading(182, 200);
+clamp.set_value(false);
+moveChainTo(50, 127);
+chassis.turnToHeading(190, 350,{.minSpeed=30});
+chassis.turnToHeading(170, 350,{.minSpeed=30});
+chassis.moveToPoint(-0.5, 15, 600,{.forwards=false,.minSpeed=30});
+
+moveChainTo(1500, 70);
+chassis.moveToPoint(10, 8, 900,{.minSpeed=50,.earlyExitRange=0.2});
+chassis.turnToHeading(90, 400,{.earlyExitRange=2});
+chassis.moveToPoint(-18, 8, 1000,{.forwards=false,.minSpeed=80,.earlyExitRange=0.2});
+chassis.turnToHeading(180, 500,{.earlyExitRange=2});
+clamp.set_value(false);
+chassis.moveToPoint(-19.5, -6, 500,{.minSpeed=30,.earlyExitRange=0.5});
+chassis.moveToPoint(-19.5, 9,700,{.forwards=false,.minSpeed=70,.earlyExitRange=1});
+chassis.moveToPoint(-19.5, -9, 500,{.minSpeed=44,.earlyExitRange=0.5});
+
+chassis.moveToPoint(-49, 18, 1000,{.forwards=false,.minSpeed=70,.earlyExitRange=1});
+moveLiftTo(200, 127);
+pros::delay(800);
+moveChainTo(2400, 50);*/
+    
+    
+}else if(auton==6){
+    chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,228);
+    chassis.moveToPoint(30, 32, 1000,{.forwards=false,.minSpeed=80,.earlyExitRange=1});
+    Rake.set_value(true);
+    moveChainTo(300, 127);
+
+    chassis.moveToPoint(8, 8, 1000,{.minSpeed=40});
+    pros::delay(600);
+    moveChainTo(1200, 127);
+    chassis.moveToPoint(9,-9,600,{.minSpeed=50});
+    chassis.moveToPoint(9, 3, 500,{.forwards=false,.minSpeed=60});
+    Rake.set_value(false);
+    chassis.moveToPoint(9, -8, 700,{.minSpeed=50});
+     pros::delay(600);
+
+    double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+    chassis.setPose(((1080 - distance_Right.get()*std::cos(thetaReset))/25.4)*-1,-0.75,180);
+
+    chassis.moveToPoint(19,12.5,900,{.forwards=false,.minSpeed=60,.earlyExitRange=0.05});
+    chassis.turnToHeading(270, 400,{.earlyExitRange=0.5});
+    chassis.waitUntilDone();
+    double distanceIn= distance_Left.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-270)*(M_PI/180);
+    double yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(6, 23.65, 1000,{.minSpeed=40,.earlyExitRange=0.25});
+
+    moveChainTo(0, 127);
+    moveLiftTo(650, 127);
+    pros::delay(800);
+    moveChainTo(0, 30);
+    moveLiftTo(305, 80);
+    pros::delay(250);
+    clamp.set_value(true);
+    chassis.turnToHeading(280, 150,{.minSpeed=10});
+    chassis.turnToHeading(260, 150,{.minSpeed=10});
+
+    chassis.moveToPoint(20, 16, 800,{.forwards=false,.minSpeed=50,.earlyExitRange=0.05});
+    //moveChainTo(225, 127);
+    chassis.turnToHeading(270, 400,{.earlyExitRange=2});
+    chassis.waitUntilDone();
+     distanceIn= distance_Left.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-270)*(M_PI/180);
+     yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(-9, 13.6, 1400,{.maxSpeed=90,.earlyExitRange=0.5});
+    moveLiftTo(0,60);
+    moveChainTo(0, 127);
+
+    chassis.turnToHeading(313, 350);
+    moveChainTo(235, 127);
+     moveChainTo(235, 127);
+    chassis.moveToPoint(-18.1, 20.7, 700,{.maxSpeed=90});
+    pros::delay(650);
+    clamp.set_value(false);
+    pros::delay(250);
+
+    moveChainTo(2150, 40);
+    moveLiftTo(0, 127);
+    chassis.turnToHeading(305, 300,{.earlyExitRange=1});
+    chassis.moveToPoint(-2.45, 16.4, 600,{.forwards=false,.minSpeed=30,.earlyExitRange=0.05});
+    chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+    chassis.swingToHeading(180, lemlib::DriveSide::RIGHT, 500);
+    pros::delay(200);
+    moveChainTo(2400, 48);
+    pros::delay(420);
+    clamp.set_value(true);
+chassis.turnToHeading(180,250);
+
+chassis.waitUntilDone();
+thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose(((1080 - distance_Right.get()*std::cos(thetaReset))/25.4)*-1,8,chassis.getPose().theta);
+
+pros::delay(50);
+moveChainTo(0, 127);
+moveLiftTo(0, 127);
+pros::delay(450);
+chassis.moveToPoint(0.2, 1.25, 700,{.minSpeed=30});
+moveChainTo(225, 127);
+
+pros::delay(500);
+chainBarMotor.move(-50);
+pros::delay(250);
+clamp.set_value(false);
+moveChainTo(50,127);
+chassis.turnToHeading(193, 170,{.minSpeed=30});
+chassis.turnToHeading(170, 230,{.minSpeed=30});
+pros::delay(230);
+chainBarMotor.move(0);
+moveChainTo(2300, 100);
+chassis.moveToPoint(0.5, 15, 1000,{.forwards=false,.minSpeed=30});
+moveLiftTo(500, 127);
+pros::delay(1000);
+pros::delay(250);
+    
+    
+    
+    
+    
+    
+    
+    
+    /*chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,228);
+    chassis.moveToPoint(30, 32, 1000,{.forwards=false,.minSpeed=80,.earlyExitRange=1});
+    Rake.set_value(true);
+    moveChainTo(300, 127);
+
+    chassis.moveToPoint(8, 8, 1000,{.minSpeed=40});
+    pros::delay(600);
+    moveChainTo(1200, 127);
+    chassis.moveToPoint(9,-7,600,{.minSpeed=50});
+    chassis.moveToPoint(9, 3, 500,{.forwards=false,.minSpeed=60});
+    Rake.set_value(false);
+    chassis.moveToPoint(9, -7, 700,{.minSpeed=50});
+     pros::delay(600);
+
+    double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+    chassis.setPose(((1080 - distance_Right.get()*std::cos(thetaReset))/25.4)*-1,-0.75,180);
+
+    chassis.moveToPoint(19,13,700,{.forwards=false,.minSpeed=60,.earlyExitRange=0.2});
+    chassis.turnToHeading(270, 350,{.earlyExitRange=0.5});
+    chassis.waitUntilDone();
+    double distanceIn= distance_Left.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-269)*(M_PI/180);
+    double yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(5.5, 23.8, 1000,{.minSpeed=40,.earlyExitRange=0.25});
+
+    moveChainTo(0, 127);
+    moveLiftTo(650, 127);
+    pros::delay(800);
+    moveChainTo(0, 30);
+    moveLiftTo(310, 80);
+    pros::delay(250);
+    clamp.set_value(true);
+    chassis.turnToHeading(280, 150,{.minSpeed=10});
+    chassis.turnToHeading(260, 150,{.minSpeed=10});
+    pros::delay(360);
+
+    chassis.moveToPoint(20, 16, 800,{.forwards=false,.minSpeed=50,.earlyExitRange=0.75});
+    //moveChainTo(225, 127);
+    chassis.turnToHeading(270, 400,{.earlyExitRange=2});
+    chassis.waitUntilDone();
+     distanceIn= distance_Left.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-269.5)*(M_PI/180);
+     yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(-9, 13.8, 1400,{.minSpeed=60,.earlyExitRange=0.1});
+    moveLiftTo(0,60);
+    moveChainTo(0, 127);
+
+    chassis.turnToHeading(313, 350,{.earlyExitRange=2});
+    moveChainTo(222, 127);
+    chassis.moveToPoint(-19, 21.42, 700);
+    pros::delay(450);
+    clamp.set_value(false);
+
+    pros::delay(200);
+
+    moveChainTo(2150, 40);
+    moveLiftTo(0, 127);
+    chassis.turnToHeading(285, 300,{.earlyExitRange=1});
+    chassis.moveToPoint(-3.3, 16.8, 600,{.forwards=false,.minSpeed=50,.earlyExitRange=0.05});
+    chassis.swingToHeading(178, lemlib::DriveSide::RIGHT, 600);
+    pros::delay(200);
+    moveChainTo(2350, 35);
+    pros::delay(470);
+    clamp.set_value(true);
+chassis.moveToPoint(chassis.getPose().x+1, chassis.getPose().y+10, 250,{.forwards=false,.minSpeed=60});
+
+chassis.waitUntilDone();
+thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose(((1080 - distance_Right.get()*std::cos(thetaReset))/25.4)*-1,8,chassis.getPose().theta);
+
+pros::delay(50);
+moveChainTo(0, 127);
+moveLiftTo(0, 127);
+pros::delay(450);
+chassis.moveToPoint(0, 0.25, 700,{.minSpeed=30});
+moveChainTo(225, 127);
+
+chainBarMotor.move(-40);
+pros::delay(250);
+clamp.set_value(false);
+moveChainTo(50,127);
+chassis.turnToHeading(165, 350,{.minSpeed=30});
+chassis.turnToHeading(195, 350,{.minSpeed=30});
+pros::delay(300);
+chainBarMotor.move(0);
+moveChainTo(2300, 100);
+chassis.moveToPoint(0.5, 15, 1000,{.forwards=false,.minSpeed=30});
+moveLiftTo(500, 127);
+pros::delay(1000);
+clamp.set_value(true);
+pros::delay(250);*/
+    
+    
+    
+}else if(auton==7){
+   chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,228);
+
+    chassis.moveToPoint(8, 6, 1000,{.forwards=false,.minSpeed=60});
+    moveChainTo(1200, 127);
+    chassis.turnToHeading(180, 500);
+    chassis.moveToPoint(8.7,-7,600,{.minSpeed=50});
+    chassis.moveToPoint(8.7, 3, 500,{.forwards=false,.minSpeed=60});
+    Rake.set_value(false);
+    chassis.moveToPoint(8.7, -7, 700,{.minSpeed=60});
+     pros::delay(600);
+
+    double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+    chassis.setPose(((1080 - distance_Right.get()*std::cos(thetaReset))/25.4)*-1,-0.75,180);
+
+    chassis.moveToPoint(19,12.5,900,{.forwards=false,.minSpeed=60,.earlyExitRange=0.05});
+    chassis.turnToHeading(270, 400,{.earlyExitRange=0.5});
+    chassis.waitUntilDone();
+    double distanceIn= distance_Left.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-270)*(M_PI/180);
+    double yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(6, 23.85, 1000,{.minSpeed=40,.earlyExitRange=0.25});
+
+    moveChainTo(0, 127);
+    moveLiftTo(650, 127);
+    pros::delay(800);
+    moveChainTo(0, 30);
+    moveLiftTo(305, 80);
+    pros::delay(250);
+    clamp.set_value(true);
+    chassis.turnToHeading(280, 150,{.minSpeed=10});
+    chassis.turnToHeading(260, 150,{.minSpeed=10});
+
+    chassis.moveToPoint(20, 16, 800,{.forwards=false,.minSpeed=50,.earlyExitRange=0.05});
+    //moveChainTo(225, 127);
+    chassis.turnToHeading(270, 400,{.earlyExitRange=2});
+    chassis.waitUntilDone();
+     distanceIn= distance_Left.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-270)*(M_PI/180);
+     yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(-9, 13.6, 1400,{.maxSpeed=90,.earlyExitRange=0.5});
+    moveLiftTo(0,60);
+    moveChainTo(0, 127);
+
+    chassis.turnToHeading(313, 350);
+    moveChainTo(235, 127);
+     moveChainTo(240, 127);
+    chassis.moveToPoint(-18.15, 20.75, 700,{.maxSpeed=90});
+    pros::delay(650);
+    clamp.set_value(false);
+    pros::delay(250);
+
+    moveChainTo(2150, 40);
+    moveLiftTo(0, 127);
+    chassis.turnToHeading(305, 300,{.earlyExitRange=1});
+    chassis.moveToPoint(-2.45, 16.4, 600,{.forwards=false,.minSpeed=30,.earlyExitRange=0.05});
+    chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+    chassis.swingToHeading(180, lemlib::DriveSide::RIGHT, 500);
+    pros::delay(200);
+    moveChainTo(2400, 48);
+    pros::delay(420);
+    clamp.set_value(true);
+chassis.turnToHeading(180,250);
+
+chassis.waitUntilDone();
+thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose(((1080 - distance_Right.get()*std::cos(thetaReset))/25.4)*-1,8,chassis.getPose().theta);
+
+pros::delay(50);
+moveChainTo(0, 127);
+moveLiftTo(0, 127);
+pros::delay(450);
+chassis.moveToPoint(0.2, 1.25, 700,{.minSpeed=30});
+moveChainTo(225, 127);
+
+pros::delay(500);
+chainBarMotor.move(-50);
+pros::delay(250);
+clamp.set_value(false);
+moveChainTo(50,127);
+chassis.turnToHeading(193, 170,{.minSpeed=30});
+chassis.turnToHeading(170, 230,{.minSpeed=30});
+pros::delay(230);
+chainBarMotor.move(0);
+moveChainTo(2300, 100);
+chassis.moveToPoint(0.5, 15, 1000,{.forwards=false,.minSpeed=30});
+moveLiftTo(500, 127);
+pros::delay(1000);
+pros::delay(250);
+    
+}else if(auton==8){
+    chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,228);
+    chassis.moveToPoint(8, 6, 800,{.forwards=false,.minSpeed=60,.earlyExitRange=0.2});
+    moveChainTo(1200, 127);
+    chassis.turnToHeading(180, 300,{.earlyExitRange=2});
+    //pros::delay(600);
+    chassis.moveToPoint(8.7,-7,600,{.minSpeed=50});
+    chassis.moveToPoint(8.7, 2, 500,{.forwards=false,.minSpeed=60});
+    chassis.moveToPoint(8.7, -7, 600,{.minSpeed=60});
+    pros::delay(500);
+
+    double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+    chassis.setPose(((1080 - distance_Right.get()*std::cos(thetaReset))/25.4)*-1,-0.75,180);
+
+    chassis.moveToPoint(19,12.5,900,{.forwards=false,.minSpeed=60,.earlyExitRange=0.05});
+    chassis.turnToHeading(270, 400,{.earlyExitRange=0.5});
+    chassis.waitUntilDone();
+    chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+    double distanceIn= distance_Left.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-270)*(M_PI/180);
+    double yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(6, 25.4, 1000,{.minSpeed=40,.earlyExitRange=0.25});
+
+    moveChainTo(0, 127);
+    moveLiftTo(650, 127);
+    pros::delay(800);
+    moveChainTo(0, 30);
+    moveLiftTo(305, 80);
+    pros::delay(250);
+    clamp.set_value(true);
+    chassis.turnToHeading(280, 150,{.minSpeed=10});
+    chassis.turnToHeading(260, 150,{.minSpeed=10});
+
+    chassis.moveToPoint(20, 17, 800,{.forwards=false,.minSpeed=50,.earlyExitRange=0.05});
+    //moveChainTo(225, 127);
+    chassis.turnToHeading(270, 400,{.earlyExitRange=2});
+    chassis.waitUntilDone();
+     distanceIn= distance_Left.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-270)*(M_PI/180);
+     yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(-9, 13.6, 1400,{.maxSpeed=90,.earlyExitRange=0.5});
+    moveLiftTo(0,60);
+    moveChainTo(0, 127);
+
+    chassis.turnToHeading(313, 350);
+    moveChainTo(235, 127);
+     moveChainTo(240, 127);
+    chassis.moveToPoint(-18.3, 20.4, 700,{.maxSpeed=90});
+    pros::delay(650);
+    clamp.set_value(false);
+    pros::delay(250);
+
+    moveChainTo(2150, 40);
+    moveLiftTo(0, 127);
+    chassis.turnToHeading(305, 300,{.earlyExitRange=1});
+    chassis.moveToPoint(-2.45, 16.7, 600,{.forwards=false,.minSpeed=30,.earlyExitRange=0.05});
+    chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+    chassis.swingToHeading(180, lemlib::DriveSide::RIGHT, 500);
+    pros::delay(200);
+    moveChainTo(2400, 48);
+    pros::delay(420);
+    clamp.set_value(true);
+chassis.turnToHeading(180,250);
+
+chassis.waitUntilDone();
+thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose(((1080 - distance_Right.get()*std::cos(thetaReset))/25.4)*-1,8,chassis.getPose().theta);
+
+pros::delay(50);
+moveChainTo(0, 127);
+moveLiftTo(0, 127);
+pros::delay(450);
+chassis.moveToPoint(0.2, 1.35, 700,{.minSpeed=30});
+moveChainTo(225, 127);
+
+pros::delay(500);
+chainBarMotor.move(-50);
+pros::delay(250);
+clamp.set_value(false);
+moveChainTo(50,127);
+chassis.turnToHeading(193, 170,{.minSpeed=30});
+chassis.turnToHeading(170, 230,{.minSpeed=30});
+pros::delay(230);
+chainBarMotor.move(0);
+moveChainTo(1700, 100);
+chassis.moveToPoint(0.8, 15, 500,{.forwards=false,.minSpeed=50});
+moveLiftTo(270, 127);
+//chassis.swingToHeading(90, lemlib::DriveSide::RIGHT, 400,{.earlyExitRange=2});
+chassis.moveToPoint(28, 10, 800,{.minSpeed=80,.earlyExitRange=0.5});
+chassis.turnToHeading(246, 400,{.earlyExitRange=2});
+chassis.moveToPoint(50, 15.6, 1000,{.forwards=false,.minSpeed=80,.earlyExitRange=0.5});
+pros::delay(150);
+moveChainTo(2400, 10);
+    
+    
+    
+}else if(auton==9){
+   chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,132);
+    chassis.moveToPoint(-8, 6, 800,{.forwards=false,.minSpeed=60,.earlyExitRange=0.2});
+    moveChainTo(1200, 127);
+    chassis.turnToHeading(180, 300,{.earlyExitRange=2});
+    //pros::delay(600);
+    chassis.moveToPoint(-8.7,-7,600,{.minSpeed=50});
+    chassis.moveToPoint(-9, 3, 500,{.forwards=false,.minSpeed=60});
+    chassis.moveToPoint(-8.7, -4, 700,{.minSpeed=60});
+    pros::delay(500);
+
+    double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+    chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,-0.75,180);
+
+    chassis.moveToPoint(-19,13,900,{.forwards=false,.minSpeed=60,.earlyExitRange=0.5});
+    chassis.turnToHeading(90, 500);
+    chassis.waitUntilDone();
+    double distanceIn= distance_Right.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-90)*(M_PI/180);
+    double yValue=(distanceIn * std::cos(thetaReset))+5.25;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(-7, 23.9, 1000,{.minSpeed=40,.earlyExitRange=0.25});
+    moveChainTo(0, 127);
+    moveLiftTo(650, 127);
+    pros::delay(600);
+    moveChainTo(0, 30);
+    moveLiftTo(280, 80);
+    pros::delay(350);
+    clamp.set_value(true);
+    chassis.turnToHeading(100, 180,{.minSpeed=10});
+    chassis.turnToHeading(80, 180,{.minSpeed=10});
+    pros::delay(180);
+
+    chassis.moveToPose(-24, 24,90, 1000,{.forwards=false,.maxSpeed=90});
+    pros::delay(400);
+    moveLiftTo(0, 127);
+    chassis.waitUntilDone();
+    distanceIn= distance_Right.get_distance()/25.4;
+const double yZero=470/25.4;
+ thetaReset = (chassis.getPose().theta-89)*(M_PI/180);
+ yValue=(yZero - distanceIn * std::cos(thetaReset))*-1;
+chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+chassis.turnToHeading(40, 400);
+moveChainTo(234,60);
+chassis.moveToPoint(-3.4,19.02,800,{.maxSpeed=80});
+pros::delay(875);
+clamp.set_value(false);
+pros::delay(250);
+moveChainTo(2300,55);
+chassis.turnToHeading(350, 400);
+moveChainTo(2300,55);
+pros::delay(200);
+chassis.moveToPoint(1, -5, 900,{.forwards=false,.minSpeed=35});
+pros::delay(800);
+clamp.set_value(true);
+pros::delay(250);
+moveLiftTo(100, 127);
+moveChainTo(0, 127);
+pros::delay(275);
+chassis.moveToPoint(0,18,600,{.maxSpeed=90});
+
+chassis.turnToHeading(110, 400);
+moveLiftTo(0, 127);
+chassis.moveToPoint(17, 3.5,750,{.maxSpeed=80});
+moveChainTo(243,127);
+chassis.moveToPoint(18.,1.5, 1000,{.maxSpeed=25,.earlyExitRange=0.05});
+pros::delay(950);
+clamp.set_value(false);
+chassis.turnToHeading(75, 400);
+moveChainTo(1500,90);
+chassis.moveToPoint(-2, -3, 700,{.forwards=false,.minSpeed=45});
+moveLiftTo(400,127);
+pros::delay(500);
+moveChainTo(2250,45);
+pros::delay(470);
+clamp.set_value(true);
+pros::delay(150);
+moveLiftTo(700, 127);
+pros::delay(300);
+moveChainTo(0,127);
+pros::delay(650);
+moveLiftTo(0,127);
+pros::delay(200);
+ 
+    
+}else if(auton==10){
+    chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,0);
+    moveLiftTo(650, 127);
+    moveChainTo(50, 127);
+    chassis.turnToHeading(320, 400);
+    chassis.moveToPoint(-15,15 , 1000,{.minSpeed=40});
+    pros::delay(800);
+    moveLiftTo(270, 127);
+    pros::delay(250);
+    clamp.set_value(true);
+
+    chassis.turnToHeading(330, 180);
+    chassis.turnToHeading(310, 180);
+    chassis.moveToPoint(3,3, 800,{.forwards=false});
+    chassis.turnToHeading(132, 550);
+    chassis.moveToPoint(-7.6, 7.75, 700,{.forwards=false,.minSpeed=40,.earlyExitRange=0.05});
+    moveLiftTo(0, 127);
+    moveChainTo(0,127);
+    chassis.swingToHeading(180, lemlib::DriveSide::LEFT, 500);
+
+chassis.waitUntilDone();
+pros::delay(70);
+double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,8,chassis.getPose().theta);
+pros::delay(50);
+chassis.moveToPoint(0.2, 1.3, 700,{.minSpeed=30});
+moveChainTo(225, 127);
+
+pros::delay(500);
+chainBarMotor.move(-60);
+pros::delay(250);
+clamp.set_value(false);
+moveChainTo(50,127);
+chassis.turnToHeading(193, 170,{.minSpeed=30});
+chassis.turnToHeading(170, 230,{.minSpeed=30});
+pros::delay(230);
+chainBarMotor.move(0);
+moveChainTo(2250, 60);
+chassis.moveToPoint(-0.8, 15, 600,{.forwards=false,.minSpeed=50});
+
+pros::delay(1000);
+clamp.set_value(true);
+pros::delay(200);
+moveLiftTo(100, 127);
+moveChainTo(600, 127);
+pros::delay(350);
+leftMotors.move(24);
+rightMotors.move(-127);
+pros::delay(400);
+leftMotors.move(0);
+rightMotors.move(0);
+chassis.moveToPoint(-31,9,1000,{.minSpeed=46,.earlyExitRange=0.05});
+chassis.turnToHeading(270, 500,{.earlyExitRange=1});
+
+chassis.waitUntilDone();
+double distanceIn= distance_Left.get_distance()/25.4;
+const double yZero=470/25.4;
+thetaReset = (chassis.getPose().theta-270)*(M_PI/180);
+double yValue=(yZero - distanceIn * std::cos(thetaReset));
+chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+chassis.turnToHeading(180, 400,{.earlyExitRange=1});
+moveChainTo(0, 127);
+chassis.waitUntilDone();
+thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose(((1080 - distance_Right.get()*std::cos(thetaReset))/25.4),chassis.getPose().y,chassis.getPose().theta);
+moveChainTo(0, 127);
+chassis.moveToPoint(-9,-10,600,{.minSpeed=55});
+chassis.moveToPoint(-9, 8, 575,{.forwards=false,.minSpeed=55});
+chassis.moveToPoint(-9, -10, 700,{.minSpeed=55});
+pros::delay(675);
+thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose(((1080 - distance_Right.get()*std::cos(thetaReset))/25.4)*-1,0,chassis.getPose().theta);
+chassis.turnToHeading(140, 300);
+chassis.moveToPoint(4.85,4.6,800,{.forwards=false,.maxSpeed=100,.earlyExitRange=0.05});
+chassis.swingToHeading(178, lemlib::DriveSide::LEFT,525);
+//chassis.moveToPoint(chassis.getPose().x, chassis.getPose().y+10, 150,{.forwards=false,.minSpeed=60});
+
+chassis.waitUntilDone();
+thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Right.get()*std::cos(thetaReset))/25.4,8,chassis.getPose().theta);
+pros::delay(50);
+chassis.moveToPoint(0, 1, 700,{.minSpeed=30});
+moveChainTo(225, 127);
+pros::delay(500);
+chainBarMotor.move(-60);
+pros::delay(250);
+clamp.set_value(false);
+
+moveChainTo(50,127);
+chassis.turnToHeading(193, 170,{.minSpeed=30});
+chassis.turnToHeading(170, 230,{.minSpeed=30});
+pros::delay(230);
+chainBarMotor.move(0);
+moveChainTo(2350, 60);
+moveLiftTo(200,127);
+chassis.moveToPoint(-0.8, 15, 600,{.forwards=false,.minSpeed=50});
+pros::delay(1000);
+
+
+
+}else if(auton==11){
+   chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,131);
+    chassis.swingToHeading(183, lemlib::DriveSide::LEFT, 750,{.minSpeed=40,.earlyExitRange=2});
+    moveChainTo(1170, 127);
+    chassis.moveToPoint(-2.4, -7, 400,{.minSpeed=50});
+    chassis.moveToPoint(-2.4, 2.5, 350,{.forwards=false,.minSpeed=70,.earlyExitRange=.5});
+    chassis.moveToPoint(-2.4, -6, 500,{.minSpeed=70});
+    chassis.waitUntilDone();
+
+    double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+    chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,-0.75,180);
+    chassis.moveToPoint(-15,10.5, 800,{.forwards=false,.minSpeed=60,.earlyExitRange=0.1});
+
+    moveLiftTo(680, 127);
+    pros::delay(200);
+    moveChainTo(0,127);
+    chassis.turnToHeading(90, 400,{.earlyExitRange=0.5});
+    chassis.waitUntilDone();
+    double distanceIn= distance_Right.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-90)*(M_PI/180);
+    double yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(-2, 23.2, 800,{.minSpeed=40,.earlyExitRange=1});
+
+    pros::delay(450);
+    moveLiftTo(270, 127);
+    pros::delay(400);
+    clamp.set_value(true);
+    chassis.turnToHeading(100, 150);
+    chassis.turnToHeading(80, 150);
+    chassis.moveToPoint(-16.35, 24, 400,{.forwards=false,.minSpeed=30,.earlyExitRange=0.05});
+    chassis.waitUntilDone();
+    chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+
+    distanceIn= distance_Right.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-90)*(M_PI/180);
+    yValue=(distanceIn * std::cos(thetaReset))+5;
+    pros::delay(50);
+    moveLiftTo(1, 127);
+    moveChainTo(220,127);
+    chassis.turnToHeading(136, 400);
+    chassis.moveToPoint(-3.5, 10.7, 900);
+    chassis.swingToHeading(153.5, lemlib::DriveSide::RIGHT, 275);
+    chassis.moveToPoint(-0.9, 6.8, 200,{.minSpeed=50});
+
+    pros::delay(125);
+    chainBarMotor.move(-42);
+    pros::delay(170);
+    clamp.set_value(false);
+    chassis.turnToHeading(160, 190);
+    chainBarMotor.move(0);
+    chassis.turnToHeading(135, 190);
+    pros::delay(100);
+    chainBarMotor.move(0);
+    pros::delay(150);
+    moveChainTo(1800,90);
+    chassis.moveToPoint(-40, 23.5, 1100,{.forwards=false,.minSpeed=80,.earlyExitRange=0.1});
+    moveLiftTo(240, 127);
+    
+
+    chassis.moveToPoint(-49, 24, 700,{.forwards=false,.minSpeed=60});
+    moveChainTo(2380,60);
+    moveLiftTo(250, 127);
+    pros::delay(400);
+    clamp.set_value(true);
+    pros::delay(150);
+    moveLiftTo(400, 127);
+    moveChainTo(0,127);
+    pros::delay(300);
+
+    chassis.moveToPose(-24, 23, 90, 800,{.minSpeed=35,.earlyExitRange=0.05});
+    chassis.waitUntilDone();
+    distanceIn= distance_Right.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-90)*(M_PI/180);
+    yValue=(distanceIn * std::cos(thetaReset))+5;
+    pros::delay(50);
+    chassis.moveToPoint(-3, 46.8,800,{.minSpeed=55,.earlyExitRange=0.1});
+    moveLiftTo(285,60);
+    chassis.moveToPoint(-2, 49.3,400,{.maxSpeed=70,.earlyExitRange=0.1});
+    pros::delay(400);
+    clamp.set_value(false);
+
+    chassis.turnToHeading(345, 350);
+    moveChainTo(2350,50);
+    chassis.moveToPoint(-2.9, 27, 800,{.forwards=false,.minSpeed=30});
+    moveLiftTo(0, 30);
+    pros::delay(820);
+    clamp.set_value(true);
+    pros::delay(200);
+    chassis.turnToHeading(0, 300);
+
+    moveLiftTo(260, 60);
+    pros::delay(100);
+    moveChainTo(0,127);
+    pros::delay(200);
+    chassis.waitUntilDone();
+    thetaReset = (chassis.getPose().theta-0)*(M_PI/180);
+    chassis.setPose((1080 - distance_Right.get()*std::cos(thetaReset))/25.4,chassis.getPose().y,chassis.getPose().theta);
+    
+    chassis.moveToPoint(3, 44, 600,{.minSpeed=30,.earlyExitRange=0.1});
+    chassis.waitUntilDone();
+    chassis.setBrakeMode(pros::E_MOTOR_BRAKE_HOLD);
+    chassis.turnToHeading(122, 400,{.earlyExitRange=1});
+    chassis.moveToPoint(23.5, 23.5, 500,{.minSpeed=55,.earlyExitRange=0.1});
+    chassis.moveToPoint(27.1,21.3, 320,{.maxSpeed=70,.earlyExitRange=0.1});
+    chassis.waitUntilDone();
+    clamp.set_value(false);
+    pros::delay(150);
+    moveChainTo(2000,67);
+    moveLiftTo(400, 127);
+    chassis.moveToPoint(33, 60,800,{.forwards=false,.minSpeed=65});
+    
+}else if(auton==12){
+    chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,0);
+    moveLiftTo(650, 127);
+    moveChainTo(50, 127);
+    chassis.turnToHeading(40, 400);
+    chassis.moveToPoint(15,15 , 1000,{.minSpeed=40});
+    pros::delay(800);
+    moveLiftTo(270, 127);
+    pros::delay(250);
+    clamp.set_value(true);
+    chassis.turnToHeading(30, 180);
+    chassis.turnToHeading(50, 180);
+    chassis.moveToPoint(-3,3, 800,{.forwards=false});
+    chassis.turnToHeading(228, 550);
+    chassis.moveToPoint(9.5, 6.6, 700,{.forwards=false,.minSpeed=40,.earlyExitRange=0.05});
+    moveLiftTo(0, 127);
+    moveChainTo(0,127);
+    chassis.swingToHeading(180, lemlib::DriveSide::RIGHT, 500);
+chassis.waitUntilDone();
+pros::delay(70);
+double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Right.get()*std::cos(thetaReset))/25.4,8,chassis.getPose().theta);
+pros::delay(50);
+
+chassis.moveToPoint(0.45, 1.3, 700,{.minSpeed=30});
+moveChainTo(225, 127);
+
+pros::delay(500);
+chainBarMotor.move(-60);
+pros::delay(350);
+clamp.set_value(false);
+moveChainTo(50,127);
+chassis.turnToHeading(167, 170,{.minSpeed=30});
+chassis.turnToHeading(190, 230,{.minSpeed=30});
+pros::delay(230);
+chainBarMotor.move(0);
+moveChainTo(2250, 60);
+chassis.moveToPoint(-0.8, 15, 600,{.forwards=false,.minSpeed=50});
+pros::delay(1000);
+clamp.set_value(true);
+pros::delay(200);
+moveLiftTo(100, 127);
+moveChainTo(0, 127);
+pros::delay(350);
+//chassis.turnToHeading(100,400)
+chassis.moveToPoint(15,13,600,{.minSpeed=46,.earlyExitRange=0.05});
+
+chassis.moveToPoint(29,10,1000,{.minSpeed=46,.earlyExitRange=0.05});
+chassis.turnToHeading(90, 500,{.earlyExitRange=1});
+chassis.waitUntilDone();
+double distanceIn= distance_Right.get_distance()/25.4;
+const double yZero=470/25.4;
+ thetaReset = (chassis.getPose().theta-90)*(M_PI/180);
+ double yValue=(yZero - distanceIn * std::cos(thetaReset));
+chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+chassis.turnToHeading(180, 400,{.earlyExitRange=1});
+chassis.waitUntilDone();
+thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose(((1080 - distance_Left.get()*std::cos(thetaReset))/25.4),chassis.getPose().y,chassis.getPose().theta);
+chassis.moveToPoint(-18,-13,600,{.minSpeed=55});
+chassis.moveToPoint(-18, 3, 575,{.forwards=false,.minSpeed=55});
+chassis.moveToPoint(-18, -13, 700,{.minSpeed=65});
+pros::delay(675);
+ thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose(((1080 - distance_Left.get()*std::cos(thetaReset))/25.4),0,chassis.getPose().theta);
+chassis.turnToHeading(240, 300);
+chassis.moveToPoint(-4.85,4.35,800,{.forwards=false,.maxSpeed=100,.earlyExitRange=0.05});
+chassis.swingToHeading(180, lemlib::DriveSide::RIGHT,525);
+chassis.moveToPoint(chassis.getPose().x, chassis.getPose().y+10, 150,{.forwards=false,.minSpeed=60});
+
+chassis.waitUntilDone();
+ thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose((1080 - distance_Left.get()*std::cos(thetaReset))/25.4,8,chassis.getPose().theta);
+
+pros::delay(50);
+
+chassis.moveToPoint(0.38, 1.6, 700,{.minSpeed=30});
+moveChainTo(225, 127);
+
+pros::delay(500);
+chainBarMotor.move(-60);
+pros::delay(350);
+clamp.set_value(false);
+moveChainTo(50,127);
+chassis.turnToHeading(167,170,{.minSpeed=30});
+chassis.turnToHeading(190, 230,{.minSpeed=30});
+pros::delay(230);
+chainBarMotor.move(0);
+moveChainTo(2350, 60);
+moveLiftTo(200,127);
+chassis.moveToPoint(-0.8, 15, 600,{.forwards=false,.minSpeed=50});
+pros::delay(1000);
+}else if(auton==13){
+chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    chainBarMotor.brake();
+    liftMotors.set_brake_mode(pros::E_MOTOR_BRAKE_HOLD);
+    liftMotors.brake();
+    chassis.setPose(0,0,228);
+    chassis.moveToPoint(30, 32, 1000,{.forwards=false,.minSpeed=80,.earlyExitRange=1});
+    Rake.set_value(true);
+    moveChainTo(300, 127);
+
+    chassis.moveToPoint(8, 8, 1000,{.minSpeed=40});
+    pros::delay(600);
+    moveChainTo(1200, 127);
+    chassis.moveToPoint(9,-9.7,650,{.minSpeed=50});
+    chassis.moveToPoint(9, 3, 500,{.forwards=false,.minSpeed=60});
+    Rake.set_value(false);
+    chassis.moveToPoint(9, -8, 700,{.minSpeed=50});
+     pros::delay(600);
+
+    double thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+    chassis.setPose(((1080 - distance_Right.get()*std::cos(thetaReset))/25.4)*-1,-0.75,180);
+
+    chassis.moveToPoint(19,12.5,900,{.forwards=false,.minSpeed=60,.earlyExitRange=0.05});
+    chassis.turnToHeading(270, 470,{.earlyExitRange=0.5});
+    chassis.waitUntilDone();
+    double distanceIn= distance_Left.get_distance()/25.4;
+    thetaReset = (chassis.getPose().theta-270)*(M_PI/180);
+    double yValue=(distanceIn * std::cos(thetaReset))+5;
+    chassis.setPose(chassis.getPose().x,yValue,chassis.getPose().theta);
+    chassis.moveToPoint(6, 23.65, 1000,{.minSpeed=40,.earlyExitRange=0.25});
+
+    moveChainTo(0, 127);
+    moveLiftTo(650, 127);
+    pros::delay(800);
+    moveChainTo(0, 30);
+    moveLiftTo(305, 80);
+    pros::delay(250);
+    clamp.set_value(true);
+    chassis.turnToHeading(280, 150,{.minSpeed=10});
+    chassis.turnToHeading(260, 150,{.minSpeed=10});
+
+    chassis.moveToPoint(16, 16, 800,{.forwards=false,.minSpeed=50,.earlyExitRange=0.05});
+    chassis.turnToHeading(100, 400,{.earlyExitRange=2});
+    chassis.moveToPoint(1.75, 19.25, 700,{.forwards=false});
+    chassis.swingToHeading(181, lemlib::DriveSide::LEFT, 500);
+    chassis.waitUntilDone();
+thetaReset = (chassis.getPose().theta-180)*(M_PI/180);
+chassis.setPose(((1080 - distance_Right.get()*std::cos(thetaReset))/25.4)*-1,8,chassis.getPose().theta);
+
+pros::delay(50);
+moveChainTo(0, 127);
+moveLiftTo(0, 127);
+pros::delay(450);
+chassis.moveToPoint(0.2, 1.35, 700,{.minSpeed=30});
+moveChainTo(225, 127);
+
+pros::delay(500);
+chainBarMotor.move(-50);
+pros::delay(250);
+clamp.set_value(false);
+moveChainTo(50,127);
+chassis.turnToHeading(193, 170,{.minSpeed=30});
+chassis.turnToHeading(170, 230,{.minSpeed=30});
+pros::delay(230);
+chainBarMotor.move(0);
+moveChainTo(2350, 60);
+chassis.moveToPoint(0, 12, 1000,{.forwards=false});
+
+}else if(auton==14){
+    chassis.setPose(0,0,0);
+    chassis.turnToHeading(90, 500);
+    pros::delay(2500);
+    chassis.turnToHeading(0, 500);
+}
+
+
+
+
+   
+
+}
+
+/**
+ * Runs in driver control
+ */
+
+    
+bool coast=false;
+bool wedgeValue=false;
+
+
+    int DEADBAND = 5;
+void opcontrol() {
+
+        
+
+
+autonRunning=false;
+        
+       
+       pros::Task lowerTaskHandle(lowerTask);
+       
+    while (true) {
+         int leftX = controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_X);
+     
+        int rightY = controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_Y);
+        //chassis.arcade(rightY, leftX,false);*/
+        int leftMotorSpeed= controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_Y)+controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_X);
+        int rightMotorSpeed= controller.get_analog(pros::E_CONTROLLER_ANALOG_RIGHT_Y)- controller.get_analog(pros::E_CONTROLLER_ANALOG_LEFT_X);
+        if(rightY>120||rightY<-120){
+
+        }
+        //match driver
+        if(rightY<10&&rightY>-10){
+            if(leftX<90&&leftX>-90){
+                leftMotorSpeed=leftMotorSpeed*0.5;
+                rightMotorSpeed= rightMotorSpeed*0.5;
+            }
+        }
+        //skills driver
+         /*if(rightY<75&&rightY>-75){
+            if(leftX<127&&leftX>-127){
+                leftMotorSpeed=leftMotorSpeed*0.5;
+                rightMotorSpeed= rightMotorSpeed*0.5;
+            }
+        }else{
+            leftMotorSpeed=leftMotorSpeed*0.7;
+            rightMotorSpeed=rightMotorSpeed*0.7;
+        }*/
+
+        if(abs(leftMotorSpeed) <DEADBAND){
+            leftMotors.move(0);
+            
+        }else{
+            leftMotors.move(leftMotorSpeed);
+            
+
+        }
+
+        if(abs(rightMotorSpeed)<DEADBAND){
+            rightMotors.move(0);
+        }else{
+            rightMotors.move(rightMotorSpeed);
+            
+        }
+
+
+        
+
+
+                if (controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_UP)){
+                    pinPrime=true;
+                moveLiftTo(450, 127);
+                moveChainTo(190, 127);
+
+}
+
+        
+        if(controller.get_digital(pros::E_CONTROLLER_DIGITAL_R1)){
+            cascadeOverride=true;
+            if(liftMotors.get_position()>2560){
+            liftMotors.move(0);
+            }else if(liftMotors.get_position()<2560){
+                liftMotors.move(127);
+            }else{
+                liftMotors.move(0);
+            }
+        }else if(controller.get_digital(pros::E_CONTROLLER_DIGITAL_R2)){
+            cascadeOverride=true;
+            if(liftMotors.get_position()>0){
+            liftMotors.move(-127);
+            }else{
+                liftMotors.move(0);
+            }
+        }else{
+            cascadeOverride=false;
+            liftMotors.set_brake_mode(pros::MotorBrake::hold);
+            liftMotors.brake();
+            
+        }
+    
+    
+    
+
+
+
+    
+    if(controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_L2)){
+    clampValue = !clampValue;
+    clamp.set_value(clampValue); 
+    downToggle=false;
+    if(clampValue==false&&chainBarMotor.get_position()<700){
+        autoraise=true;
+
+    }
+}
+
+
+        
+        if(controller.get_digital(pros::E_CONTROLLER_DIGITAL_RIGHT)){
+            driverOverride=true;
+            chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_COAST);
+
+            if(chainBarMotor.get_position()>2500){
+            chainBarMotor.move(0);
+                        primeH=false;
+
+            }else if(chainBarMotor.get_position()>1700){
+                chainBarMotor.move(44);
+                            primeH=false;
+
+            }else if(chainBarMotor.get_position()<1700){
+                chainBarMotor.move(67);
+                            primeH=false;
+
+            }else{
+                chainBarMotor.move(0);
+            }
+        }else if(controller.get_digital(pros::E_CONTROLLER_DIGITAL_DOWN)){
+            driverOverride=true;
+            chainBarMotor.set_brake_mode(pros::E_MOTOR_BRAKE_COAST);
+
+            if(chainBarMotor.get_position()>300){
+                chainBarMotor.move(-70);
+                            primeH=false;
+
+            }else if(chainBarMotor.get_position()<300){
+            chainBarMotor.move(-20);
+                        primeH=false;
+
+            }else if(chainBarMotor.get_position()<0){
+                chainBarMotor.move(0);
+            }
+        }else{
+            chainBarMotor.set_brake_mode(pros::MotorBrake::hold);
+            chainBarMotor.brake();
+            driverOverride=false;
+           
+        }
+    
+
+
+
+        if(controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_L1)){
+                moveLiftTo(270, 127);
+                moveChainTo(40,60);
+                resetLowerRequest=false;
+                pickUp=true;
+                primeH=true;
+              
+                
+            
+        }
+
+
+        if(controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_B)){
+            resetLowerRequest=true;
+            pickUp=false;
+        }
+
+
+        if(controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_Y)){
+            rakeValue = !rakeValue;
+            Rake.set_value(rakeValue);
+        }
+
+   
+
+
+        if(controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_A)){
+            wedgeValue=!wedgeValue;
+            wedge.set_value(wedgeValue);
+        }
+
+
+
+
+
+
+
+
+        if(controller.get_digital_new_press(pros::E_CONTROLLER_DIGITAL_X)){
+           driverMoveChainTo(1550,127);
+        }
+
+
+
+
+
+
+
+
+  
+    
+  
+
+
+
+		
+    
+    
+
+        pros::delay(20);
+    }
+}
+   
